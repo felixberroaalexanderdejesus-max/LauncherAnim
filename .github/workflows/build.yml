@@ -104,6 +104,7 @@ jobs:
 
           import java.lang.ref.WeakReference;
           import java.util.Collections;
+          import java.util.LinkedHashMap;
           import java.util.Map;
           import java.util.Set;
           import java.util.WeakHashMap;
@@ -141,13 +142,13 @@ jobs:
               // La curva nunca baja del radio de pantalla (x CORNER_MULT) mientras la ventana está reducida.
               static final boolean CORNER_FLOOR = true;
 
-              // Factores de lentitud. Antes 1.5 para ambos: apertura +0.20 => 1.70, cierre +0.35 => 1.85.
+              // Factores de lentitud. Antes 1.5 para ambos: apertura 1.70, cierre 1.95.
               static final float SPEED_OPEN = 1.7f;
-              static final float SPEED_CLOSE = 1.85f;
+              static final float SPEED_CLOSE = 1.95f;
 
               // Duraciones base (ms) que ya usabas, multiplicadas por el factor. Pon 0 para no tocarlas.
               static final long APP_LAUNCH_MS = Math.round(400 * SPEED_OPEN);       // 680
-              static final int CLOSE_MS = (int) Math.round(300 * SPEED_CLOSE);      // 555
+              static final int CLOSE_MS = (int) Math.round(300 * SPEED_CLOSE);      // 585
 
               // Ralentizar también el resorte del cierre con gesto (RectFSpringAnim).
               static final boolean SLOW_GESTURE_SPRING = true;
@@ -211,18 +212,35 @@ jobs:
               private static final class SurfState {
                   float scale = 1f;
                   float cw = 0f, ch = 0f;
-                  long radiusTs = 0;   // != 0 si el sistema ya fija radio en esta superficie
+                  float lastOrig = 0f;     // último radio que fijó el sistema (sin modificar)
+                  long radiusTs = 0;
+                  boolean logged = false;
               }
 
-              private static final Map<Object, SurfState> SURF =
-                      Collections.synchronizedMap(new WeakHashMap<Object, SurfState>());
+              // Clave = id de capa (o identidad si no hay): no depende de que sea el mismo objeto Java.
+              private static final Map<Integer, SurfState> SURF =
+                      Collections.synchronizedMap(new LinkedHashMap<Integer, SurfState>() {
+                          @Override
+                          protected boolean removeEldestEntry(Map.Entry<Integer, SurfState> e) {
+                              return size() > 64;
+                          }
+                      });
+
+              private static int surfKey(Object sc) {
+                  try {
+                      Object id = XposedHelpers.callMethod(sc, "getLayerId");
+                      if (id instanceof Integer && (Integer) id >= 0) return (Integer) id;
+                  } catch (Throwable ignored) { }
+                  return System.identityHashCode(sc);
+              }
 
               private static SurfState surf(Object sc) {
                   if (sc == null) return new SurfState();
-                  SurfState s = SURF.get(sc);
+                  int k = surfKey(sc);
+                  SurfState s = SURF.get(k);
                   if (s == null) {
                       s = new SurfState();
-                      SURF.put(sc, s);
+                      SURF.put(k, s);
                   }
                   return s;
               }
@@ -515,6 +533,13 @@ jobs:
                               }
                           } catch (Throwable ignored) { }
                       }
+
+                      @Override
+                      protected void afterHookedMethod(MethodHookParam p) {
+                          try {
+                              if (p.args.length >= 1) injectCorner(p.thisObject, p.args[0]);
+                          } catch (Throwable ignored) { }
+                      }
                   });
 
                   XC_MethodHook crop = new XC_MethodHook() {
@@ -563,6 +588,7 @@ jobs:
                               float orig = (Float) p.args[1];
                               SurfState st = surf(p.args[0]);
                               st.radiusTs = SystemClock.uptimeMillis();
+                              st.lastOrig = orig;
                               float v = buttonCloseRadius(orig);
                               if (v < 0f) v = generalRadius(st, orig);
                               p.args[1] = v;
@@ -578,25 +604,42 @@ jobs:
               private static float generalRadius(SurfState st, float orig) {
                   float local = orig * CORNER_MULT;
                   float s = st.scale;
-                  if (!CORNER_FLOOR || s >= 0.9995f || s < 0.02f || st.cw <= 0f || st.ch <= 0f) return local;
-                  float pill = Math.min(st.cw, st.ch) * s / 2f;
-                  float floor = Math.min(pill, sWindowRadius * CORNER_MULT);
+                  if (!CORNER_FLOOR || s >= 0.9995f || s < 0.02f) return local;
+                  float floor = sWindowRadius * CORNER_MULT;
+                  float pill = Float.MAX_VALUE;                       // sin recorte conocido: sin tope
+                  if (st.cw > 0f && st.ch > 0f) pill = Math.min(st.cw, st.ch) * s / 2f;
+                  floor = Math.min(pill, floor);
                   float vis = Math.min(Math.max(local * s, floor), pill);
                   return vis / s;
               }
 
-              /** Si el sistema nunca fija radio en esta superficie reducida, lo ponemos nosotros. */
+              /**
+               * Pone el radio mínimo en superficies reducidas (recientes, mantener presionado...).
+               * Se llama tras setMatrix y setWindowCrop: da igual en qué orden aplique el sistema su propio
+               * radio, porque el del sistema también pasa por aquí y nunca baja del mínimo.
+               */
               private static void injectCorner(Object tx, Object sc) {
                   if (!CORNER_FLOOR || sc == null || IN_INJECT.get() != null) return;
+                  long now = SystemClock.uptimeMillis();
+                  // Cierre botón/atrás activo: su radio animado lo calcula buttonCloseRadius.
+                  if ((now - sBtnTs) < 80 || (sSessionStart != 0 && (now - sLastCall) < 250)) return;
                   SurfState st = surf(sc);
-                  if (st.radiusTs != 0L) return;                      // el sistema ya lo maneja
-                  if (st.scale >= 0.9995f || st.scale < 0.02f || st.cw <= 0f || st.ch <= 0f) return;
-                  float r = generalRadius(st, 0f);
+                  if (st.scale >= 0.9995f || st.scale < 0.02f) return;
+                  float r = generalRadius(st, st.lastOrig);
                   if (r <= 0f) return;
                   IN_INJECT.set(Boolean.TRUE);
                   try {
                       XposedHelpers.callMethod(tx, "setCornerRadius", sc, r);
-                  } catch (Throwable ignored) {
+                      if (!st.logged) {
+                          st.logged = true;
+                          XposedBridge.log("[AnimHook] esquinas aplicadas: escala=" + st.scale
+                                  + " radio=" + r + " (sistema=" + st.lastOrig + ")");
+                      }
+                  } catch (Throwable t) {
+                      if (!st.logged) {
+                          st.logged = true;
+                          XposedBridge.log("[AnimHook] no pude fijar radio: " + t);
+                      }
                   } finally {
                       IN_INJECT.remove();
                   }
