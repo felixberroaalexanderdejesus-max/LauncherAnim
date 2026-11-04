@@ -230,6 +230,8 @@ jobs:
                   long frozenUntil = 0;                 // no registrar poses (salto de end())
                   boolean hasCrop = false;
                   int cl, ct, cr, cb;                   // último recorte aplicado
+                            float px = 1f, py = 1f, ptx = 0f, pty = 0f; // última matriz (escala/posición)
+                            long poseTs = 0;
               }
 
               // Clave = id de capa (o identidad si no hay): no depende de que sea el mismo objeto Java.
@@ -283,6 +285,7 @@ jobs:
               private static volatile float sGestureProg = 1f;  // progreso del resorte del cierre con gesto
               private static final ThreadLocal<Boolean> IN_HO = new ThreadLocal<>();
               private static float sMinDim = 0f;
+              private static volatile int sDiagLeft = 0;  // diagnóstico: fotogramas a registrar tras iniciar el gesto
 
               private static float minDim() {
                   if (sMinDim <= 0f) {
@@ -352,6 +355,7 @@ jobs:
               private static void hoObserve(int key, SurfState st, float[] mv, long now) {
                   boolean first = !st.seen;
                   st.seen = true;
+                            if (now < sBtnUntil) return; // cierre botón/atrás: lo resuelve startCloseFromOpenPose
                   if (sHoOn) {
                       if (now - sHoStart > HANDOFF_MS + 60) endHandoff();
                       else return;
@@ -517,6 +521,7 @@ jobs:
                   if (SLOW_GESTURE_SPRING) hookSpringSpeed(cl);
                   hookSurfaceCorners();
                   hookInterrupt(cl);
+                  hookGestureDiag(cl);
               }
 
               /** Radio de las esquinas físicas de la pantalla (px). */
@@ -557,7 +562,8 @@ jobs:
                           new XC_MethodHook() {
                               @Override
                               protected void beforeHookedMethod(MethodHookParam p) {
-                                  sBtnUntil = SystemClock.uptimeMillis() + CLOSE_MS + 1000;
+                                  if (REVERSE_ON_INTERRUPT) startCloseFromOpenPose(p);
+                                        sBtnUntil = SystemClock.uptimeMillis() + CLOSE_MS + 1000;
                                   sSessionStart = 0;
                               }
 
@@ -794,6 +800,19 @@ jobs:
                                       }
                                   }
                                   s = (float) Math.hypot(v[Matrix.MSCALE_X], v[Matrix.MSKEW_Y]);
+                                          SurfState ps = surf(p.args[0]);
+                                          ps.px = v[Matrix.MSCALE_X];
+                                          ps.py = v[Matrix.MSCALE_Y];
+                                          ps.ptx = v[Matrix.MTRANS_X];
+                                          ps.pty = v[Matrix.MTRANS_Y];
+                                          ps.poseTs = SystemClock.uptimeMillis();
+                                          if (sDiagLeft > 0) {
+                                              sDiagLeft--;
+                                              XposedBridge.log("[AnimHook] DIAG matriz capa=" + surfKey(p.args[0])
+                                                      + " esc=" + v[Matrix.MSCALE_X] + " tx=" + v[Matrix.MTRANS_X]
+                                                      + " ty=" + v[Matrix.MTRANS_Y]
+                                                      + " msDesdeFotogramaApertura=" + (sOpenTs == 0 ? -1 : ps.poseTs - sOpenTs));
+                                          }
                               } else if (p.args.length == 5 && p.args[1] instanceof Float) {
                                   s = (float) Math.hypot((Float) p.args[1], (Float) p.args[2]);
                               }
@@ -1020,6 +1039,77 @@ jobs:
                   }
               }
 
+          /**
+           * En este launcher el cierre con botón/atrás NO es un ValueAnimator: es un resorte (RectFSpringAnim) que
+           * arranca desde el rectángulo "rectF" completo de la ventana. Por eso, si se cierra mientras abre, la app
+           * saltaba a pantalla completa y la ventana vieja (congelada) quedaba superpuesta a la nueva.
+           * Aquí se cambia ese rectángulo de partida (y el radio) por la pose donde iba la apertura.
+           * Argumentos de getClosingWindowAnimators: (AnimatorSet, Target[], View, PointF, RectF, float).
+           */
+          private static void startCloseFromOpenPose(XC_MethodHook.MethodHookParam p) {
+              try {
+                  long now = SystemClock.uptimeMillis();
+                  if (sOpenTs == 0 || now - sOpenTs > 500 || sOpenFrac >= 0.985f) return;
+                  if (p.args.length < 6 || !(p.args[4] instanceof RectF) || !(p.args[5] instanceof Float)) return;
+
+                  SurfState best = null;
+                  synchronized (SURF) {
+                      for (SurfState st : SURF.values()) {
+                          if (!st.hasCrop || st.poseTs == 0 || now - st.poseTs > 500) continue;
+                          if (st.px >= 0.9995f || st.px < 0.02f) continue;
+                          if (best == null || st.poseTs > best.poseTs) best = st;
+                      }
+                  }
+                  if (best == null) return;
+
+                  // Rectángulo visible = recorte llevado por la matriz (coordenadas del target).
+                  RectF r = new RectF(
+                          best.ptx + best.cl * best.px, best.pty + best.ct * best.py,
+                          best.ptx + best.cr * best.px, best.pty + best.cb * best.py);
+                  if (r.width() < 2f || r.height() < 2f) return;
+
+                  // A coordenadas del launcher (lo inverso de lo que hace SpringAnimRunner al aplicar).
+                  if (p.args[1] instanceof Object[]) {
+                      for (Object t : (Object[]) p.args[1]) {
+                          if (t == null || XposedHelpers.getIntField(t, "mode") != 1) continue;
+                          try {
+                              RectF out = new RectF();
+                              XposedHelpers.callMethod(p.thisObject, "transferRectToTargetCoordinate", t, r, true, out);
+                              if (out.width() > 2f && out.height() > 2f) r = out;
+                          } catch (Throwable ignored) { }
+                          break;
+                      }
+                  }
+
+                  float rad = best.lastOrig > 0f ? best.lastOrig * best.px : (Float) p.args[5];
+                  p.args[4] = r;
+                  p.args[5] = rad;
+                  XposedBridge.log("[AnimHook] cierre arranca desde la pose de la apertura: " + r
+                          + " radio=" + rad + " apertura iba en " + sOpenFrac);
+              } catch (Throwable t) {
+                  XposedBridge.log(t);
+              }
+          }
+          /** Diagnóstico: cuándo arranca el gesto respecto a la apertura (y registra los siguientes fotogramas). */
+          private void hookGestureDiag(ClassLoader cl) {
+              Class<?> h = XposedHelpers.findClassIfExists("com.android.quickstep.AbsSwipeUpHandler", cl);
+              if (h == null) {
+                  XposedBridge.log("[AnimHook] DIAG sin AbsSwipeUpHandler");
+                  return;
+              }
+              XC_MethodHook d = new XC_MethodHook() {
+                  @Override
+                  protected void beforeHookedMethod(MethodHookParam p) {
+                      long now = SystemClock.uptimeMillis();
+                      sDiagLeft = 24;
+                      XposedBridge.log("[AnimHook] DIAG " + p.method.getName() + ": aperturaFrac=" + sOpenFrac
+                              + " msDesdeFotogramaApertura=" + (sOpenTs == 0 ? -1 : now - sOpenTs)
+                              + " msDesdeInicioApertura=" + (sOpenStartTs == 0 ? -1 : now - sOpenStartTs));
+                  }
+              };
+              XposedBridge.hookAllMethods(h, "onGestureStarted", d);
+              XposedBridge.hookAllMethods(h, "onRecentsAnimationStart", d);
+          }
               private static boolean openInProgress() {
                   return sOpenAnim != null
                           && (SystemClock.uptimeMillis() - sOpenTs) < 150
