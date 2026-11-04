@@ -28,7 +28,10 @@ jobs:
               repositories {
                   google()
                   mavenCentral()
-                  maven { url 'https://api.xposed.info/' }
+                  maven {
+                      url 'https://api.xposed.info/'
+                      content { includeGroup 'de.robv.android.xposed' }
+                  }
               }
           }
           rootProject.name = "ColorOS17Anim"
@@ -57,8 +60,8 @@ jobs:
                   applicationId 'com.alex.coloros17'
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '1.1'
               }
 
               compileOptions {
@@ -71,7 +74,16 @@ jobs:
               compileOnly 'de.robv.android.xposed:api:82'
           }
           END_3
-          mkdir -p app/src/main
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/arrays.xml <<'END_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposedscope">
+                  <item>android</item>
+                  <item>com.android.systemui</item>
+              </string-array>
+          </resources>
+          END_7
           cat > app/src/main/AndroidManifest.xml <<'END_4'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -79,8 +91,9 @@ jobs:
                   android:label="ColorOS 17 Anim"
                   android:allowBackup="false">
                   <meta-data android:name="xposedmodule" android:value="true" />
-                  <meta-data android:name="xposeddescription" android:value="Animacion de entrada estilo ColorOS 17 a nivel sistema" />
+                  <meta-data android:name="xposeddescription" android:value="Animaciones estilo ColorOS 17: transiciones de apps y desbloqueo (Android 16)" />
                   <meta-data android:name="xposedminversion" android:value="82" />
+                  <meta-data android:name="xposedscope" android:resource="@array/xposedscope" />
               </application>
           </manifest>
           END_4
@@ -92,6 +105,7 @@ jobs:
           cat > app/src/main/java/com/alex/coloros17/MainHook.java <<'END_6'
           package com.alex.coloros17;
 
+          import android.animation.ValueAnimator;
           import android.view.animation.AccelerateDecelerateInterpolator;
           import android.view.animation.AlphaAnimation;
           import android.view.animation.Animation;
@@ -101,40 +115,58 @@ jobs:
           import android.view.animation.ScaleAnimation;
 
           import java.lang.reflect.Field;
-          import java.util.HashMap;
           import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
+          import java.util.concurrent.atomic.AtomicInteger;
 
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
           import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
           import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
           /**
-           * Base hook: reemplaza las animaciones de transición de apps a nivel sistema.
-           * Scope en LSPosed: "Android" (system_server) y "System UI".
-           * Punto de enganche: com.android.internal.policy.TransitionAnimation (framework),
-           * que carga las animaciones de apertura/cierre de actividades y tasks.
+           * Animaciones estilo ColorOS 17 para Android 16 (QPR2).
+           * Scope en LSPosed: "System Framework" (system_server) y "IU del sistema" (com.android.systemui).
+           *
+           * 1) Transiciones de apps: TransitionAnimation (framework, usado por system_server y por
+           *    el Shell de SystemUI en Android 14+).
+           * 2) Desbloqueo: KeyguardUnlockAnimationController.playCannedUnlockAnimation (SystemUI),
+           *    que es la ruta que aparece en logcat al desbloquear en esta ROM.
            */
           public class MainHook implements IXposedHookLoadPackage {
 
               private static final String TAG = "[ColorAnim] ";
 
-              // ---- Parámetros ajustables (estilo ColorOS 17, aproximado) ----
-              private static final long DURATION = 420L;
-              private static final float OPEN_ENTER_FROM = 0.88f;   // app que entra
-              private static final float OPEN_EXIT_TO = 0.96f;      // app que sale hacia atrás
-              private static final float CLOSE_ENTER_FROM = 0.96f;  // app que vuelve
-              private static final float CLOSE_EXIT_TO = 0.88f;     // app que se cierra
+              // ---- Parametros ajustables ----
+              private static final long DURATION = 420L;            // transiciones de apps
+              private static final long UNLOCK_DURATION = 380L;     // desbloqueo (AOSP usa ~200 ms)
+              private static final float OPEN_ENTER_FROM = 0.88f;
+              private static final float OPEN_EXIT_TO = 0.96f;
+              private static final float CLOSE_ENTER_FROM = 0.96f;
+              private static final float CLOSE_EXIT_TO = 0.88f;
               private static final Interpolator CURVE = new PathInterpolator(0.2f, 0f, 0f, 1f);
 
               private static final int OPEN_ENTER = 0, OPEN_EXIT = 1, CLOSE_ENTER = 2, CLOSE_EXIT = 3;
-              private final Map<Integer, Integer> attrKind = new HashMap<>();
+              private final Map<Integer, Integer> attrKind = new ConcurrentHashMap<>();
+              private final AtomicInteger transitionLogs = new AtomicInteger();
+              private final AtomicInteger unlockLogs = new AtomicInteger();
 
               @Override
               public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
-                  if (!"android".equals(lpparam.packageName)
-                          && !"com.android.systemui".equals(lpparam.packageName)) return;
+                  String pkg = lpparam.packageName;
+                  boolean isSystem = "android".equals(pkg);
+                  boolean isSysUi = "com.android.systemui".equals(pkg);
+                  if (!isSystem && !isSysUi) return;
 
+                  hookTransitions(lpparam);
+                  if (isSysUi) hookUnlock(lpparam);
+              }
+
+              // ------------------------------------------------------------------
+              // Transiciones de apps
+              // ------------------------------------------------------------------
+              private void hookTransitions(final LoadPackageParam lpparam) {
                   try {
                       mapAttrs(lpparam.classLoader);
                       Class<?> ta = Class.forName(
@@ -152,6 +184,10 @@ jobs:
                                   Integer kind = attrKind.get(attr);
                                   if (kind == null) return;
                                   param.setResult(build(kind));
+                                  if (transitionLogs.incrementAndGet() <= 5) {
+                                      XposedBridge.log(TAG + lpparam.packageName
+                                              + ": transicion reemplazada (kind=" + kind + ")");
+                                  }
                               } catch (Throwable t) {
                                   XposedBridge.log(TAG + "hook error: " + t);
                               }
@@ -160,13 +196,57 @@ jobs:
 
                       int n = XposedBridge.hookAllMethods(ta, "loadAnimationAttr", hook).size();
                       n += XposedBridge.hookAllMethods(ta, "loadDefaultAnimationAttr", hook).size();
-                      XposedBridge.log(TAG + lpparam.packageName + ": " + n + " métodos enganchados");
+                      XposedBridge.log(TAG + lpparam.packageName + ": " + n + " metodos de transicion enganchados");
                   } catch (Throwable t) {
-                      XposedBridge.log(TAG + "init error en " + lpparam.packageName + ": " + t);
+                      XposedBridge.log(TAG + "init error (transiciones) en " + lpparam.packageName + ": " + t);
                   }
               }
 
-              /** Mapea los índices de WindowAnimation_* a nuestro tipo de animación. */
+              // ------------------------------------------------------------------
+              // Desbloqueo (SystemUI)
+              // ------------------------------------------------------------------
+              private void hookUnlock(LoadPackageParam lpparam) {
+                  try {
+                      Class<?> c = XposedHelpers.findClassIfExists(
+                              "com.android.systemui.keyguard.KeyguardUnlockAnimationController",
+                              lpparam.classLoader);
+                      if (c == null) {
+                          XposedBridge.log(TAG + "KeyguardUnlockAnimationController no encontrada");
+                          return;
+                      }
+
+                      XC_MethodHook hook = new XC_MethodHook() {
+                          @Override
+                          protected void beforeHookedMethod(MethodHookParam param) {
+                              try {
+                                  Object anim = XposedHelpers.getObjectField(
+                                          param.thisObject, "surfaceBehindEntryAnimator");
+                                  if (anim instanceof ValueAnimator) {
+                                      ValueAnimator va = (ValueAnimator) anim;
+                                      long old = va.getDuration();
+                                      va.setDuration(UNLOCK_DURATION);
+                                      va.setInterpolator(CURVE);
+                                      if (unlockLogs.incrementAndGet() <= 5) {
+                                          XposedBridge.log(TAG + "desbloqueo: duracion " + old
+                                                  + " -> " + UNLOCK_DURATION + " ms");
+                                      }
+                                  } else {
+                                      XposedBridge.log(TAG + "surfaceBehindEntryAnimator no es ValueAnimator: " + anim);
+                                  }
+                              } catch (Throwable t) {
+                                  XposedBridge.log(TAG + "unlock hook error: " + t);
+                              }
+                          }
+                      };
+
+                      int n = XposedBridge.hookAllMethods(c, "playCannedUnlockAnimation", hook).size();
+                      XposedBridge.log(TAG + "desbloqueo: " + n + " metodos enganchados");
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "init error (desbloqueo): " + t);
+                  }
+              }
+
+              /** Mapea los indices de WindowAnimation_* a nuestro tipo de animacion. */
               private void mapAttrs(ClassLoader cl) throws Throwable {
                   Class<?> styleable = Class.forName("com.android.internal.R$styleable", false, cl);
                   put(styleable, "WindowAnimation_activityOpenEnterAnimation", OPEN_ENTER);
@@ -187,7 +267,7 @@ jobs:
                   try {
                       Field f = c.getField(field);
                       attrKind.put(f.getInt(null), kind);
-                  } catch (Throwable ignored) { /* no existe en esta versión */ }
+                  } catch (Throwable ignored) { /* no existe en esta version */ }
               }
 
               private Animation build(int kind) {
