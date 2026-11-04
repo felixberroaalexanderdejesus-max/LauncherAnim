@@ -112,7 +112,8 @@ jobs:
           import android.os.PowerManager;
           import android.view.View;
           import android.view.ViewGroup;
-          import android.view.animation.OvershootInterpolator;
+          import android.animation.ObjectAnimator;
+          import android.animation.TimeInterpolator;
 
           import java.util.ArrayList;
           import java.util.Collections;
@@ -132,14 +133,31 @@ jobs:
               // ===== AJUSTES (cambia estos numeros para afinar la animacion) =====
               static final float START_SCALE = 0.5f;    // escala inicial (mas bajo = mas salto)
               static final float START_DY_DP = 80f;     // cuanto suben los iconos desde abajo
-              static final long DURATION = 800;         // duracion en ms (mas alto = mas lenta)
+              static final long DURATION = 1100;        // duracion total del resorte en ms
+              static final long ALPHA_DURATION = 280;   // duracion del fundido de entrada
               static final long STAGGER = 25;           // retraso entre icono e icono
               static final long MAX_DELAY = 500;        // retraso maximo acumulado
-              static final float OVERSHOOT = 3.0f;      // rebote (mas alto = pasa mas de largo)
+              static final float SPRING_FREQ = 2.5f;    // cantidad de vaivenes (mas alto = mas rebotes)
+              static final float SPRING_DAMP = 5.0f;    // amortiguacion (mas bajo = rebota mas tiempo)
               // ===================================================================
 
               private static final Map<Activity, BroadcastReceiver> RECEIVERS = new WeakHashMap<>();
               private static volatile boolean pending = false;
+              private static final Map<View, ObjectAnimator> ALPHA_ANIMS = new WeakHashMap<>();
+
+              // Resorte amortiguado: pasa de largo y vuelve varias veces hasta asentarse
+              static class Spring implements TimeInterpolator {
+                  @Override
+                  public float getInterpolation(float t) {
+                      return (float) (1.0 - Math.exp(-SPRING_DAMP * t)
+                              * Math.cos(2.0 * Math.PI * SPRING_FREQ * t));
+                  }
+              }
+
+              private static void cancelAlpha(View v) {
+                  ObjectAnimator o = ALPHA_ANIMS.remove(v);
+                  if (o != null) o.cancel();
+              }
 
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
@@ -243,6 +261,7 @@ jobs:
                       float d = a.getResources().getDisplayMetrics().density;
                       for (View v : getIcons(a)) {
                           v.animate().cancel();
+                          cancelAlpha(v);
                           v.setAlpha(0f);
                           v.setScaleX(START_SCALE);
                           v.setScaleY(START_SCALE);
@@ -277,19 +296,28 @@ jobs:
                       float d = a.getResources().getDisplayMetrics().density;
                       for (int i = 0; i < icons.size(); i++) {
                           final View v = icons.get(i);
+                          long delay = Math.min(i * STAGGER, MAX_DELAY);
                           v.animate().cancel();
+                          cancelAlpha(v);
                           v.setAlpha(0f);
                           v.setScaleX(START_SCALE);
                           v.setScaleY(START_SCALE);
                           v.setTranslationY(START_DY_DP * d);
+
+                          // El fundido va aparte porque el alpha no puede pasarse de 1
+                          ObjectAnimator fade = ObjectAnimator.ofFloat(v, View.ALPHA, 0f, 1f);
+                          fade.setStartDelay(delay);
+                          fade.setDuration(ALPHA_DURATION);
+                          ALPHA_ANIMS.put(v, fade);
+                          fade.start();
+
                           v.animate()
-                                  .alpha(1f)
                                   .scaleX(1f)
                                   .scaleY(1f)
                                   .translationY(0f)
-                                  .setStartDelay(Math.min(i * STAGGER, MAX_DELAY))
+                                  .setStartDelay(delay)
                                   .setDuration(DURATION)
-                                  .setInterpolator(new OvershootInterpolator(OVERSHOOT))
+                                  .setInterpolator(new Spring())
                                   .withEndAction(new Runnable() {
                                       @Override
                                       public void run() {
