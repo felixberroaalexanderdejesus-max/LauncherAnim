@@ -1,316 +1,262 @@
-name: Build ColorOS17 Anim
+name: Build ColorOS Unlock Anim
+
 on:
-  push:
   workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
-      - name: Crear proyecto
+          gradle-version: 8.7
+
+      - name: Generar proyecto del modulo
         run: |
-          mkdir -p proj && cd proj
-          cat > settings.gradle <<'END_0'
+          mkdir -p proj/app/src/main/java/com/nick/colorosunlock
+          mkdir -p proj/app/src/main/assets
+          mkdir -p proj/app/src/main/res/values
+          cd proj
+
+          cat > settings.gradle <<'EOF'
           pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
           }
           dependencyResolutionManagement {
               repositories {
                   google()
                   mavenCentral()
-                  maven {
-                      url 'https://api.xposed.info/'
-                      content { includeGroup 'de.robv.android.xposed' }
-                  }
+                  maven { url 'https://api.xposed.info/' }
               }
           }
-          rootProject.name = "ColorOS17Anim"
+          rootProject.name = 'ColorOSUnlockAnim'
           include ':app'
-          END_0
-          cat > build.gradle <<'END_1'
+          EOF
+
+          cat > build.gradle <<'EOF'
           plugins {
               id 'com.android.application' version '8.5.2' apply false
           }
-          END_1
-          cat > gradle.properties <<'END_2'
+          EOF
+
+          cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx2g
           android.useAndroidX=false
-          END_2
-          mkdir -p app
-          cat > app/build.gradle <<'END_3'
-          plugins {
-              id 'com.android.application'
-          }
+          EOF
 
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
           android {
-              namespace 'com.alex.coloros17'
+              namespace 'com.nick.colorosunlock'
               compileSdk 34
-
               defaultConfig {
-                  applicationId 'com.alex.coloros17'
+                  applicationId 'com.nick.colorosunlock'
                   minSdk 26
                   targetSdk 34
-                  versionCode 3
-                  versionName '1.2'
+                  versionCode 1
+                  versionName '1.0'
               }
-
               compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_1_8
-                  targetCompatibility JavaVersion.VERSION_1_8
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
               }
           }
-
           dependencies {
               compileOnly 'de.robv.android.xposed:api:82'
           }
-          END_3
-          mkdir -p app/src/main/res/values
-          cat > app/src/main/res/values/arrays.xml <<'END_7'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <string-array name="xposedscope">
-                  <item>android</item>
-                  <item>com.android.systemui</item>
-              </string-array>
-          </resources>
-          END_7
-          cat > app/src/main/AndroidManifest.xml <<'END_4'
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <application
-                  android:label="ColorOS 17 Anim"
+                  android:label="ColorOS Unlock Anim"
                   android:allowBackup="false">
                   <meta-data android:name="xposedmodule" android:value="true" />
-                  <meta-data android:name="xposeddescription" android:value="Animaciones estilo ColorOS 17: transiciones de apps y desbloqueo (Android 16)" />
+                  <meta-data android:name="xposeddescription"
+                      android:value="Animacion de entrada de iconos al desbloquear (estilo ColorOS 17)" />
                   <meta-data android:name="xposedminversion" android:value="82" />
                   <meta-data android:name="xposedscope" android:resource="@array/xposedscope" />
               </application>
           </manifest>
-          END_4
-          mkdir -p app/src/main/assets
-          cat > app/src/main/assets/xposed_init <<'END_5'
-          com.alex.coloros17.MainHook
-          END_5
-          mkdir -p app/src/main/java/com/alex/coloros17
-          cat > app/src/main/java/com/alex/coloros17/MainHook.java <<'END_6'
-          package com.alex.coloros17;
+          EOF
 
-          import android.animation.ValueAnimator;
-          import android.view.animation.AccelerateDecelerateInterpolator;
-          import android.view.animation.AlphaAnimation;
-          import android.view.animation.Animation;
-          import android.view.animation.AnimationSet;
-          import android.view.animation.Interpolator;
-          import android.view.animation.PathInterpolator;
-          import android.view.animation.ScaleAnimation;
+          cat > app/src/main/res/values/arrays.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string-array name="xposedscope">
+                  <item>com.android.launcher3</item>
+              </string-array>
+          </resources>
+          EOF
 
-          import java.lang.reflect.Field;
+          echo "com.nick.colorosunlock.Hook" > app/src/main/assets/xposed_init
+
+          cat > app/src/main/java/com/nick/colorosunlock/Hook.java <<'EOF'
+          package com.nick.colorosunlock;
+
+          import android.app.Activity;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.animation.OvershootInterpolator;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+          import java.util.List;
           import java.util.Map;
-          import java.util.concurrent.ConcurrentHashMap;
-          import java.util.concurrent.atomic.AtomicInteger;
+          import java.util.WeakHashMap;
 
           import de.robv.android.xposed.IXposedHookLoadPackage;
           import de.robv.android.xposed.XC_MethodHook;
           import de.robv.android.xposed.XposedBridge;
           import de.robv.android.xposed.XposedHelpers;
-          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-          /**
-           * Animaciones estilo ColorOS 17 para Android 16 (QPR2).
-           * Scope en LSPosed: "System Framework" (system_server) y "IU del sistema" (com.android.systemui).
-           *
-           * 1) Transiciones de apps: TransitionAnimation (framework, usado por system_server y por
-           *    el Shell de SystemUI en Android 14+).
-           * 2) Desbloqueo: KeyguardUnlockAnimationController.playCannedUnlockAnimation (SystemUI),
-           *    que es la ruta que aparece en logcat al desbloquear en esta ROM.
-           */
-          public class MainHook implements IXposedHookLoadPackage {
+          public class Hook implements IXposedHookLoadPackage {
 
-              private static final String TAG = "[ColorAnim] ";
-
-              // ---- Parametros ajustables ----
-              private static final long DURATION = 420L;            // transiciones de apps
-              private static final long UNLOCK_DURATION = 380L;     // desbloqueo (AOSP usa ~200 ms)
-              private static final float OPEN_ENTER_FROM = 0.88f;
-              private static final float OPEN_EXIT_TO = 0.96f;
-              private static final float CLOSE_ENTER_FROM = 0.96f;
-              private static final float CLOSE_EXIT_TO = 0.88f;
-              private static final Interpolator CURVE = new PathInterpolator(0.2f, 0f, 0f, 1f);
-
-              private static final int OPEN_ENTER = 0, OPEN_EXIT = 1, CLOSE_ENTER = 2, CLOSE_EXIT = 3;
-              private final Map<Integer, Integer> attrKind = new ConcurrentHashMap<>();
-              private final AtomicInteger transitionLogs = new AtomicInteger();
-              private final AtomicInteger unlockLogs = new AtomicInteger();
-              private final AtomicInteger missLogs = new AtomicInteger();
+              private static final Map<Activity, BroadcastReceiver> RECEIVERS = new WeakHashMap<>();
+              private static long lastPlay = 0;
 
               @Override
-              public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
-                  String pkg = lpparam.packageName;
-                  boolean isSystem = "android".equals(pkg);
-                  boolean isSysUi = "com.android.systemui".equals(pkg);
-                  if (!isSystem && !isSysUi) return;
-
-                  hookTransitions(lpparam);
-                  if (isSysUi) hookUnlock(lpparam);
-              }
-
-              // ------------------------------------------------------------------
-              // Transiciones de apps
-              // ------------------------------------------------------------------
-              private void hookTransitions(final LoadPackageParam lpparam) {
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
+                  if (!"com.android.launcher3".equals(lpp.packageName)) return;
                   try {
-                      mapAttrs(lpparam.classLoader);
-                      Class<?> ta = Class.forName(
-                              "com.android.internal.policy.TransitionAnimation", false, lpparam.classLoader);
+                      Class<?> launcher = XposedHelpers.findClass(
+                              "com.android.launcher3.Launcher", lpp.classLoader);
 
-                      XC_MethodHook hook = new XC_MethodHook() {
+                      XposedBridge.hookAllMethods(launcher, "onCreate", new XC_MethodHook() {
                           @Override
-                          protected void afterHookedMethod(MethodHookParam param) {
-                              try {
-                                  // Android 14+: loadAnimationAttr(String pkg, int animStyleResId, int animAttr, boolean)
-                                  // El primer int es el estilo (0x01030xxx), NO el attr. Probamos todos los int.
-                                  Integer kind = null;
-                                  StringBuilder dbg = new StringBuilder();
-                                  for (Object a : param.args) {
-                                      dbg.append(a).append(',');
-                                      if (kind == null && a instanceof Integer) {
-                                          kind = attrKind.get((Integer) a);
-                                      }
-                                  }
-                                  if (kind == null) {
-                                      if (transitionLogs.get() < 3 && missLogs.incrementAndGet() <= 6) {
-                                          XposedBridge.log(TAG + param.method.getName() + " sin match, args=" + dbg);
-                                      }
-                                      return;
-                                  }
-                                  param.setResult(build(kind));
-                                  if (transitionLogs.incrementAndGet() <= 5) {
-                                      XposedBridge.log(TAG + lpparam.packageName
-                                              + ": transicion reemplazada (kind=" + kind + ")");
-                                  }
-                              } catch (Throwable t) {
-                                  XposedBridge.log(TAG + "hook error: " + t);
-                              }
+                          protected void afterHookedMethod(MethodHookParam p) {
+                              register((Activity) p.thisObject);
                           }
-                      };
+                      });
 
-                      int n = XposedBridge.hookAllMethods(ta, "loadAnimationAttr", hook).size();
-                      n += XposedBridge.hookAllMethods(ta, "loadDefaultAnimationAttr", hook).size();
-                      XposedBridge.log(TAG + lpparam.packageName + ": " + n + " metodos de transicion enganchados");
+                      XposedBridge.hookAllMethods(launcher, "onDestroy", new XC_MethodHook() {
+                          @Override
+                          protected void beforeHookedMethod(MethodHookParam p) {
+                              unregister((Activity) p.thisObject);
+                          }
+                      });
                   } catch (Throwable t) {
-                      XposedBridge.log(TAG + "init error (transiciones) en " + lpparam.packageName + ": " + t);
+                      XposedBridge.log("ColorOSUnlock: " + t);
                   }
               }
 
-              // ------------------------------------------------------------------
-              // Desbloqueo (SystemUI)
-              // ------------------------------------------------------------------
-              private void hookUnlock(LoadPackageParam lpparam) {
-                  try {
-                      Class<?> c = XposedHelpers.findClassIfExists(
-                              "com.android.systemui.keyguard.KeyguardUnlockAnimationController",
-                              lpparam.classLoader);
-                      if (c == null) {
-                          XposedBridge.log(TAG + "KeyguardUnlockAnimationController no encontrada");
-                          return;
+              private static void register(final Activity a) {
+                  synchronized (RECEIVERS) {
+                      if (RECEIVERS.containsKey(a)) return;
+                      BroadcastReceiver r = new BroadcastReceiver() {
+                          @Override
+                          public void onReceive(Context c, Intent i) {
+                              play(a);
+                          }
+                      };
+                      a.registerReceiver(r, new IntentFilter(Intent.ACTION_USER_PRESENT));
+                      RECEIVERS.put(a, r);
+                  }
+              }
+
+              private static void unregister(Activity a) {
+                  synchronized (RECEIVERS) {
+                      BroadcastReceiver r = RECEIVERS.remove(a);
+                      if (r != null) {
+                          try { a.unregisterReceiver(r); } catch (Throwable ignored) {}
                       }
-
-                      XC_MethodHook hook = new XC_MethodHook() {
-                          @Override
-                          protected void beforeHookedMethod(MethodHookParam param) {
-                              try {
-                                  Object anim = XposedHelpers.getObjectField(
-                                          param.thisObject, "surfaceBehindEntryAnimator");
-                                  if (anim instanceof ValueAnimator) {
-                                      ValueAnimator va = (ValueAnimator) anim;
-                                      long old = va.getDuration();
-                                      va.setDuration(UNLOCK_DURATION);
-                                      va.setInterpolator(CURVE);
-                                      if (unlockLogs.incrementAndGet() <= 5) {
-                                          XposedBridge.log(TAG + "desbloqueo: duracion " + old
-                                                  + " -> " + UNLOCK_DURATION + " ms");
-                                      }
-                                  } else {
-                                      XposedBridge.log(TAG + "surfaceBehindEntryAnimator no es ValueAnimator: " + anim);
-                                  }
-                              } catch (Throwable t) {
-                                  XposedBridge.log(TAG + "unlock hook error: " + t);
-                              }
-                          }
-                      };
-
-                      int n = XposedBridge.hookAllMethods(c, "playCannedUnlockAnimation", hook).size();
-                      XposedBridge.log(TAG + "desbloqueo: " + n + " metodos enganchados");
-                  } catch (Throwable t) {
-                      XposedBridge.log(TAG + "init error (desbloqueo): " + t);
                   }
               }
 
-              /** Mapea los indices de WindowAnimation_* a nuestro tipo de animacion. */
-              private void mapAttrs(ClassLoader cl) throws Throwable {
-                  Class<?> styleable = Class.forName("com.android.internal.R$styleable", false, cl);
-                  put(styleable, "WindowAnimation_activityOpenEnterAnimation", OPEN_ENTER);
-                  put(styleable, "WindowAnimation_activityOpenExitAnimation", OPEN_EXIT);
-                  put(styleable, "WindowAnimation_activityCloseEnterAnimation", CLOSE_ENTER);
-                  put(styleable, "WindowAnimation_activityCloseExitAnimation", CLOSE_EXIT);
-                  put(styleable, "WindowAnimation_taskOpenEnterAnimation", OPEN_ENTER);
-                  put(styleable, "WindowAnimation_taskOpenExitAnimation", OPEN_EXIT);
-                  put(styleable, "WindowAnimation_taskCloseEnterAnimation", CLOSE_ENTER);
-                  put(styleable, "WindowAnimation_taskCloseExitAnimation", CLOSE_EXIT);
-                  put(styleable, "WindowAnimation_taskToFrontEnterAnimation", OPEN_ENTER);
-                  put(styleable, "WindowAnimation_taskToFrontExitAnimation", OPEN_EXIT);
-                  put(styleable, "WindowAnimation_taskToBackEnterAnimation", CLOSE_ENTER);
-                  put(styleable, "WindowAnimation_taskToBackExitAnimation", CLOSE_EXIT);
+              private static void collect(View v, List<View> out) {
+                  if (!(v instanceof ViewGroup)) return;
+                  ViewGroup g = (ViewGroup) v;
+                  if (g.getClass().getSimpleName().equals("ShortcutAndWidgetContainer")) {
+                      for (int i = 0; i < g.getChildCount(); i++) out.add(g.getChildAt(i));
+                      return;
+                  }
+                  for (int i = 0; i < g.getChildCount(); i++) collect(g.getChildAt(i), out);
               }
 
-              private void put(Class<?> c, String field, int kind) {
+              private static void play(Activity a) {
                   try {
-                      Field f = c.getField(field);
-                      attrKind.put(f.getInt(null), kind);
-                  } catch (Throwable ignored) { /* no existe en esta version */ }
-              }
+                      long now = System.currentTimeMillis();
+                      if (now - lastPlay < 1000) return;
+                      lastPlay = now;
 
-              private Animation build(int kind) {
-                  float from, to, a0, a1;
-                  switch (kind) {
-                      case OPEN_ENTER:  from = OPEN_ENTER_FROM;  to = 1f;             a0 = 0f;   a1 = 1f; break;
-                      case OPEN_EXIT:   from = 1f;               to = OPEN_EXIT_TO;   a0 = 1f;   a1 = 0.6f; break;
-                      case CLOSE_ENTER: from = CLOSE_ENTER_FROM; to = 1f;             a0 = 0.6f; a1 = 1f; break;
-                      default:          from = 1f;               to = CLOSE_EXIT_TO;  a0 = 1f;   a1 = 0f; break;
+                      final List<View> icons = new ArrayList<>();
+                      Object ws = XposedHelpers.callMethod(a, "getWorkspace");
+                      int page = (Integer) XposedHelpers.callMethod(ws, "getCurrentPage");
+                      collect((View) XposedHelpers.callMethod(ws, "getChildAt", page), icons);
+                      try {
+                          collect((View) XposedHelpers.callMethod(a, "getHotseat"), icons);
+                      } catch (Throwable ignored) {}
+
+                      final int[] loc = new int[2];
+                      final Map<View, int[]> pos = new WeakHashMap<>();
+                      for (View v : icons) {
+                          v.getLocationOnScreen(loc);
+                          pos.put(v, new int[]{loc[0], loc[1]});
+                      }
+                      Collections.sort(icons, new Comparator<View>() {
+                          @Override
+                          public int compare(View x, View y) {
+                              int[] px = pos.get(x), py = pos.get(y);
+                              if (px[1] != py[1]) return px[1] - py[1];
+                              return px[0] - py[0];
+                          }
+                      });
+
+                      float d = a.getResources().getDisplayMetrics().density;
+                      for (int i = 0; i < icons.size(); i++) {
+                          final View v = icons.get(i);
+                          v.animate().cancel();
+                          v.setAlpha(0f);
+                          v.setScaleX(0.72f);
+                          v.setScaleY(0.72f);
+                          v.setTranslationY(36f * d);
+                          v.animate()
+                                  .alpha(1f)
+                                  .scaleX(1f)
+                                  .scaleY(1f)
+                                  .translationY(0f)
+                                  .setStartDelay(Math.min(i * 14L, 350L))
+                                  .setDuration(480)
+                                  .setInterpolator(new OvershootInterpolator(1.2f))
+                                  .withEndAction(new Runnable() {
+                                      @Override
+                                      public void run() {
+                                          v.setAlpha(1f);
+                                          v.setScaleX(1f);
+                                          v.setScaleY(1f);
+                                          v.setTranslationY(0f);
+                                      }
+                                  })
+                                  .start();
+                      }
+                  } catch (Throwable t) {
+                      XposedBridge.log("ColorOSUnlock play: " + t);
                   }
-                  AnimationSet set = new AnimationSet(false);
-
-                  ScaleAnimation scale = new ScaleAnimation(from, to, from, to,
-                          Animation.RELATIVE_TO_SELF, 0.5f, Animation.RELATIVE_TO_SELF, 0.5f);
-                  scale.setInterpolator(CURVE);
-                  scale.setDuration(DURATION);
-
-                  AlphaAnimation alpha = new AlphaAnimation(a0, a1);
-                  alpha.setInterpolator(new AccelerateDecelerateInterpolator());
-                  alpha.setDuration(kind == OPEN_ENTER ? DURATION / 2 : DURATION);
-
-                  set.addAnimation(scale);
-                  set.addAnimation(alpha);
-                  set.setDuration(DURATION);
-                  set.setFillAfter(true);
-                  return set;
               }
           }
-          END_6
-      - name: Compilar
+          EOF
+
+      - name: Compilar APK
         working-directory: proj
         run: gradle assembleDebug --no-daemon
+
       - uses: actions/upload-artifact@v4
         with:
-          name: ColorOS17Anim-apk
+          name: ColorOSUnlockAnim-apk
           path: proj/app/build/outputs/apk/debug/*.apk
