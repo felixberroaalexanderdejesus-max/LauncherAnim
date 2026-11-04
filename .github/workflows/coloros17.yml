@@ -109,6 +109,7 @@ jobs:
           import android.content.Context;
           import android.content.Intent;
           import android.content.IntentFilter;
+          import android.os.PowerManager;
           import android.view.View;
           import android.view.ViewGroup;
           import android.view.animation.OvershootInterpolator;
@@ -128,8 +129,17 @@ jobs:
 
           public class Hook implements IXposedHookLoadPackage {
 
+              // ===== AJUSTES (cambia estos numeros para afinar la animacion) =====
+              static final float START_SCALE = 0.5f;    // escala inicial (mas bajo = mas salto)
+              static final float START_DY_DP = 80f;     // cuanto suben los iconos desde abajo
+              static final long DURATION = 800;         // duracion en ms (mas alto = mas lenta)
+              static final long STAGGER = 25;           // retraso entre icono e icono
+              static final long MAX_DELAY = 500;        // retraso maximo acumulado
+              static final float OVERSHOOT = 3.0f;      // rebote (mas alto = pasa mas de largo)
+              // ===================================================================
+
               private static final Map<Activity, BroadcastReceiver> RECEIVERS = new WeakHashMap<>();
-              private static long lastPlay = 0;
+              private static volatile boolean pending = false;
 
               @Override
               public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
@@ -151,6 +161,23 @@ jobs:
                               unregister((Activity) p.thisObject);
                           }
                       });
+
+                      // Disparo temprano: el launcher recupera el foco cuando empieza el desbloqueo
+                      XposedHelpers.findAndHookMethod(Activity.class, "onWindowFocusChanged",
+                              boolean.class, new XC_MethodHook() {
+                          @Override
+                          protected void afterHookedMethod(MethodHookParam p) {
+                              Activity a = (Activity) p.thisObject;
+                              boolean hasFocus = (Boolean) p.args[0];
+                              if (!hasFocus || !pending) return;
+                              synchronized (RECEIVERS) {
+                                  if (!RECEIVERS.containsKey(a)) return;
+                              }
+                              PowerManager pm = (PowerManager) a.getSystemService(Context.POWER_SERVICE);
+                              if (pm != null && !pm.isInteractive()) return;
+                              play(a);
+                          }
+                      });
                   } catch (Throwable t) {
                       XposedBridge.log("ColorOSUnlock: " + t);
                   }
@@ -162,10 +189,20 @@ jobs:
                       BroadcastReceiver r = new BroadcastReceiver() {
                           @Override
                           public void onReceive(Context c, Intent i) {
-                              play(a);
+                              String act = i.getAction();
+                              if (Intent.ACTION_SCREEN_OFF.equals(act)) {
+                                  pending = true;
+                                  hide(a);
+                              } else if (Intent.ACTION_USER_PRESENT.equals(act)) {
+                                  // respaldo por si el disparo temprano no ocurrio
+                                  if (pending) play(a);
+                              }
                           }
                       };
-                      a.registerReceiver(r, new IntentFilter(Intent.ACTION_USER_PRESENT));
+                      IntentFilter f = new IntentFilter();
+                      f.addAction(Intent.ACTION_SCREEN_OFF);
+                      f.addAction(Intent.ACTION_USER_PRESENT);
+                      a.registerReceiver(r, f);
                       RECEIVERS.put(a, r);
                   }
               }
@@ -189,19 +226,38 @@ jobs:
                   for (int i = 0; i < g.getChildCount(); i++) collect(g.getChildAt(i), out);
               }
 
-              private static void play(Activity a) {
+              private static List<View> getIcons(Activity a) throws Throwable {
+                  List<View> icons = new ArrayList<>();
+                  Object ws = XposedHelpers.callMethod(a, "getWorkspace");
+                  int page = (Integer) XposedHelpers.callMethod(ws, "getCurrentPage");
+                  collect((View) XposedHelpers.callMethod(ws, "getChildAt", page), icons);
                   try {
-                      long now = System.currentTimeMillis();
-                      if (now - lastPlay < 1000) return;
-                      lastPlay = now;
+                      collect((View) XposedHelpers.callMethod(a, "getHotseat"), icons);
+                  } catch (Throwable ignored) {}
+                  return icons;
+              }
 
-                      final List<View> icons = new ArrayList<>();
-                      Object ws = XposedHelpers.callMethod(a, "getWorkspace");
-                      int page = (Integer) XposedHelpers.callMethod(ws, "getCurrentPage");
-                      collect((View) XposedHelpers.callMethod(ws, "getChildAt", page), icons);
-                      try {
-                          collect((View) XposedHelpers.callMethod(a, "getHotseat"), icons);
-                      } catch (Throwable ignored) {}
+              // Oculta los iconos al apagar la pantalla para que no se vean quietos al desbloquear
+              private static void hide(Activity a) {
+                  try {
+                      float d = a.getResources().getDisplayMetrics().density;
+                      for (View v : getIcons(a)) {
+                          v.animate().cancel();
+                          v.setAlpha(0f);
+                          v.setScaleX(START_SCALE);
+                          v.setScaleY(START_SCALE);
+                          v.setTranslationY(START_DY_DP * d);
+                      }
+                  } catch (Throwable t) {
+                      XposedBridge.log("ColorOSUnlock hide: " + t);
+                      pending = false;
+                  }
+              }
+
+              private static void play(Activity a) {
+                  pending = false;
+                  try {
+                      final List<View> icons = getIcons(a);
 
                       final int[] loc = new int[2];
                       final Map<View, int[]> pos = new WeakHashMap<>();
@@ -223,17 +279,17 @@ jobs:
                           final View v = icons.get(i);
                           v.animate().cancel();
                           v.setAlpha(0f);
-                          v.setScaleX(0.72f);
-                          v.setScaleY(0.72f);
-                          v.setTranslationY(36f * d);
+                          v.setScaleX(START_SCALE);
+                          v.setScaleY(START_SCALE);
+                          v.setTranslationY(START_DY_DP * d);
                           v.animate()
                                   .alpha(1f)
                                   .scaleX(1f)
                                   .scaleY(1f)
                                   .translationY(0f)
-                                  .setStartDelay(Math.min(i * 14L, 350L))
-                                  .setDuration(480)
-                                  .setInterpolator(new OvershootInterpolator(1.2f))
+                                  .setStartDelay(Math.min(i * STAGGER, MAX_DELAY))
+                                  .setDuration(DURATION)
+                                  .setInterpolator(new OvershootInterpolator(OVERSHOOT))
                                   .withEndAction(new Runnable() {
                                       @Override
                                       public void run() {
