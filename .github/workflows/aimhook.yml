@@ -1,0 +1,1071 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Crear proyecto
+        run: |
+          mkdir -p proj && cd proj
+          cat > settings.gradle <<'END_FILE_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://api.xposed.info/' }
+              }
+          }
+          rootProject.name = "LauncherAnim"
+          include ':app'
+          END_FILE_0
+          cat > build.gradle <<'END_FILE_1'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          END_FILE_1
+          cat > gradle.properties <<'END_FILE_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          END_FILE_2
+          mkdir -p app
+          cat > app/build.gradle <<'END_FILE_3'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.launcheranim'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.example.launcheranim'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          END_FILE_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'END_FILE_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="Launcher Anim"
+                  android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Animaciones estilo Samsung para el launcher" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+              </application>
+          </manifest>
+          END_FILE_4
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/xposed_init <<'END_FILE_5'
+          com.example.launcheranim.AnimHook
+          END_FILE_5
+          mkdir -p app/src/main/java/com/example/launcheranim
+          cat > app/src/main/java/com/example/launcheranim/AnimHook.java <<'END_FILE_6'
+          package com.example.launcheranim; // cambia al paquete de tu módulo
+
+          import android.animation.Animator;
+          import android.animation.AnimatorSet;
+          import android.animation.ValueAnimator;
+          import android.content.res.Resources;
+          import android.graphics.Matrix;
+          import android.graphics.Rect;
+          import android.graphics.RectF;
+          import android.os.SystemClock;
+          import android.view.animation.Interpolator;
+
+          import java.lang.ref.WeakReference;
+          import java.util.Collections;
+          import java.util.LinkedHashMap;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.WeakHashMap;
+          import java.util.concurrent.ConcurrentHashMap;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.XposedHelpers;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+
+          /**
+           * Animaciones estilo Samsung para el launcher (LSPosed).
+           *
+           *  - Apertura:            radio de esquina con curva t^p (mWindowRadius / cornerInterpolator).
+           *  - Cierre con gesto:    sin escalón de 4 px + curva espejo (mLastCornerRadius / getCornerRadius).
+           *  - Cierre botón/atrás:  radio ANIMADO, misma curva espejo.
+           *  - Esquinas +20%:       TODO radio que el launcher aplica a una superficie se multiplica por CORNER_MULT.
+           *  - Curva siempre lista: mientras una ventana está reducida (apertura, cierre, recientes, mantener
+           *                         el gesto) el radio visible nunca baja de un mínimo; si el sistema no pone
+           *                         radio (esquinas filosas), se inyecta.
+           *  - Velocidad:           apertura x SPEED_OPEN, cierre x SPEED_CLOSE (también el resorte del gesto).
+           *  - Interrupción:        si cierras mientras abre, la animación NO salta al final: el cierre arranca
+           *                         desde el punto donde iba la apertura (retrocede).
+           */
+          public class AnimHook implements IXposedHookLoadPackage {
+
+              // ───────────── AJUSTES ─────────────
+              // Curva del radio. 1.0 = lineal. Entre 1.6 y 2.6 se acerca al look Samsung.
+              static final float CORNER_POW = 2.0f;
+
+              // Multiplicador de TODAS las esquinas (1.2 = +20%).
+              static final float CORNER_MULT = 1.2f;
+
+              // La curva nunca baja del radio de pantalla (x CORNER_MULT) mientras la ventana está reducida.
+              static final boolean CORNER_FLOOR = true;
+
+              // Factores de lentitud. Antes 1.5 para ambos: apertura 1.70, cierre 1.90.
+              static final float SPEED_OPEN = 1.7f;
+              static final float SPEED_CLOSE = 1.90f;
+
+              // Duraciones base (ms) que ya usabas, multiplicadas por el factor. Pon 0 para no tocarlas.
+              static final long APP_LAUNCH_MS = Math.round(400 * SPEED_OPEN);       // 680
+              static final int CLOSE_MS = (int) Math.round(300 * SPEED_CLOSE);      // 570
+
+              // Ralentizar también el resorte del cierre con gesto (RectFSpringAnim).
+              static final boolean SLOW_GESTURE_SPRING = true;
+
+              // Cerrar mientras abre: retroceder desde donde iba en vez de saltar al final.
+              static final boolean REVERSE_ON_INTERRUPT = true;
+
+              // Traspaso suave: si una animación interrumpe a otra (deslizar durante la apertura, reabrir
+              // durante el cierre) la ventana continúa desde donde estaba y converge a la nueva en HANDOFF_MS.
+              static final boolean SMOOTH_HANDOFF = true;
+              static final long HANDOFF_MS = 280;
+              // ───────────────────────────────────
+
+              static final String QTM = "com.android.launcher3.QuickstepTransitionManager";
+              static final String MVUL = "com.android.quickstep.util.MultiValueUpdateListener";
+              static final String SPRING = "com.android.quickstep.util.RectFSpringAnim";
+              static final String SPRING_FORCE = "androidx.dynamicanimation.animation.SpringForce";
+              static final String ANIM_RESULT = "com.android.launcher3.LauncherAnimationRunner$AnimationResult";
+
+              static float clamp01(float t) {
+                  return t < 0f ? 0f : (t > 1f ? 1f : t);
+              }
+
+              // Apertura: el radio cambia tarde (t^p) y no de golpe al inicio.
+              static final Interpolator OPEN_CURVE = new Interpolator() {
+                  @Override
+                  public float getInterpolation(float t) {
+                      return (float) Math.pow(clamp01(t), CORNER_POW);
+                  }
+              };
+
+              // Cierre: espejo temporal de la apertura.
+              static float closeProgress(float f) {
+                  return 1f - (float) Math.pow(1f - clamp01(f), CORNER_POW);
+              }
+
+              private final Set<Object> patched =
+                      Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<Object, Boolean>()));
+              private final Set<Class<?>> hookedRunners =
+                      Collections.newSetFromMap(new ConcurrentHashMap<Class<?>, Boolean>());
+              private final ConcurrentHashMap<Class<?>, Boolean> closeListenerCache = new ConcurrentHashMap<>();
+              private final ConcurrentHashMap<Class<?>, Boolean> openListenerCache = new ConcurrentHashMap<>();
+
+              private static final ThreadLocal<Boolean> IN_SPRING = new ThreadLocal<>();
+              private static final ThreadLocal<Boolean> IN_INJECT = new ThreadLocal<>();
+
+              // ── Estado del cierre con botón/atrás ──
+              private static volatile long sBtnTs = 0;          // último fotograma visto del listener de cierre
+              private static volatile float sBtnProg = 0f;      // progreso real (getAnimatedFraction)
+              private static volatile long sBtnUntil = 0;       // ventana de respaldo si no vemos el listener
+              private static volatile long sGestureTs = 0;      // último fotograma del cierre con gesto
+              private static long sSessionStart = 0, sLastCall = 0;
+              private static float sR0 = 0f;
+              private static volatile float sScale = 1f, sCropW = 0f, sCropH = 0f;
+
+              // ── Estado de la apertura (para retroceder si se interrumpe) ──
+              private static volatile long sOpenTs = 0;                         // último fotograma de la apertura
+              private static volatile float sOpenFrac = 1f;                     // fracción de tiempo de la apertura
+              private static volatile WeakReference<ValueAnimator> sOpenAnim = null;
+              private static volatile WeakReference<Animator> sCloseAnim = null; // animador de cierre recién compuesto
+
+              // ── Radio de esquina de pantalla (px, escala 1) ──
+              private static volatile float sWindowRadius = 0f;
+
+              // ── Estado por superficie (escala y recorte) ──
+              private static final class SurfState {
+                  float scale = 1f;
+                  float cw = 0f, ch = 0f;
+                  float lastOrig = 0f;     // último radio que fijó el sistema (sin modificar)
+                  long radiusTs = 0;
+                  boolean logged = false;
+
+                  boolean loggedSys = false;
+                  // traspaso
+                  boolean seen = false;                 // ya se vio esta capa
+                  float rsx = 1f, rsy = 1f, rtx = 0f, rty = 0f; // última matriz pedida por el sistema
+                  boolean rm = false;
+                  boolean fixMatrix = false;            // reponer la matriz mezclada tras el primer recorte
+                  long frozenUntil = 0;                 // no registrar poses (salto de end())
+                  boolean hasCrop = false;
+                  int cl, ct, cr, cb;                   // último recorte aplicado
+              }
+
+              // Clave = id de capa (o identidad si no hay): no depende de que sea el mismo objeto Java.
+              private static final Map<Integer, SurfState> SURF =
+                      Collections.synchronizedMap(new LinkedHashMap<Integer, SurfState>() {
+                          @Override
+                          protected boolean removeEldestEntry(Map.Entry<Integer, SurfState> e) {
+                              return size() > 64;
+                          }
+                      });
+
+              private static int surfKey(Object sc) {
+                  try {
+                      Object id = XposedHelpers.callMethod(sc, "getLayerId");
+                      if (id instanceof Integer && (Integer) id >= 0) return (Integer) id;
+                  } catch (Throwable ignored) { }
+                  return System.identityHashCode(sc);
+              }
+
+              private static SurfState surf(Object sc) {
+                  if (sc == null) return new SurfState();
+                  int k = surfKey(sc);
+                  SurfState s = SURF.get(k);
+                  if (s == null) {
+                      s = new SurfState();
+                      SURF.put(k, s);
+                  }
+                  return s;
+              }
+
+              // ───────────── Traspaso suave entre animaciones ─────────────
+              // Al interrumpirse una animación, el sistema entrega una ventana nueva ya en su posición inicial y la
+              // anterior salta al final. Aquí se recuerda la última pose "buena" de la ventana animada; al detectar
+              // la interrupción, la ventana nueva arranca desde esa pose y converge a la animación nueva.
+              private static final class Pose {
+                  float sx = 1f, sy = 1f, tx = 0f, ty = 0f;
+                  float cl = 0f, ct = 0f, cr = 0f, cb = 0f;
+                  boolean hasC = false;
+                  long ts = 0;
+                  int key = -1;
+              }
+
+              private static final Object HO = new Object();
+              private static final Pose sLast = new Pose();     // última pose buena de la ventana animada
+              private static final Pose sHoFrom = new Pose();   // pose de partida del traspaso activo
+              private static boolean sHoOn = false;
+              private static int sHoKey = -1;                   // -1: aún sin elegir la ventana destino
+              private static long sHoStart = 0;
+              private static volatile long sCloseCutTs = 0;     // un cierre quedó a medias porque empezó otra animación
+              private static volatile long sOpenStartTs = 0;    // inicio de la apertura más reciente
+              private static volatile float sGestureProg = 1f;  // progreso del resorte del cierre con gesto
+              private static final ThreadLocal<Boolean> IN_HO = new ThreadLocal<>();
+              private static float sMinDim = 0f;
+
+              private static float minDim() {
+                  if (sMinDim <= 0f) {
+                      try {
+                          android.util.DisplayMetrics dm = Resources.getSystem().getDisplayMetrics();
+                          sMinDim = Math.min(dm.widthPixels, dm.heightPixels);
+                      } catch (Throwable t) {
+                          sMinDim = 1080f;
+                      }
+                  }
+                  return sMinDim;
+              }
+
+              /** Llamar justo antes de limpiar el estado de cierre: ¿había un cierre a medias? */
+              private static void markCloseCut() {
+                  long now = SystemClock.uptimeMillis();
+                  boolean btn = sBtnTs != 0 && (now - sBtnTs) < 250 && sBtnProg < 0.985f;
+                  boolean ges = sGestureTs != 0 && (now - sGestureTs) < 250 && sGestureProg < 0.985f;
+                  if (btn || ges) sCloseCutTs = now;
+              }
+
+              /** Hay una animación a medias que acaba de ser interrumpida (cierre cortado o apertura que dejó de avanzar). */
+              private static boolean interruptContext(long now) {
+                  boolean closeCut = sCloseCutTs != 0 && (now - sCloseCutTs) < 400;
+                  boolean openCut = sOpenTs != 0 && sOpenFrac < 0.985f
+                          && (now - sOpenTs) < 250 && (now - sOpenStartTs) > 150;
+                  return closeCut || openCut;
+              }
+
+              private static boolean differs(Pose p, float sx, float sy, float tx, float ty) {
+                  float d = minDim() * 0.10f;
+                  return Math.abs(p.sx - sx) > 0.08f || Math.abs(p.sy - sy) > 0.08f
+                          || Math.abs(p.tx - tx) > d || Math.abs(p.ty - ty) > d;
+              }
+
+              private static void endHandoff() {
+                  if (sHoOn) XposedBridge.log("[AnimHook] traspaso terminado");
+                  sHoOn = false;
+                  sHoKey = -1;
+              }
+
+              private static void armHandoff(int key, long now) {
+                  sHoFrom.sx = sLast.sx;
+                  sHoFrom.sy = sLast.sy;
+                  sHoFrom.tx = sLast.tx;
+                  sHoFrom.ty = sLast.ty;
+                  sHoFrom.key = sLast.key;
+                  sHoFrom.hasC = false;
+                  SurfState old = SURF.get(sLast.key);
+                  if (old != null && old.hasCrop) {
+                      sHoFrom.cl = old.cl;
+                      sHoFrom.ct = old.ct;
+                      sHoFrom.cr = old.cr;
+                      sHoFrom.cb = old.cb;
+                      sHoFrom.hasC = true;
+                  }
+                  sHoOn = true;
+                  sHoKey = key;
+                  sHoStart = now;
+                  XposedBridge.log("[AnimHook] traspaso armado desde escala=" + sLast.sx
+                          + (key == -1 ? " (capa nueva)" : " (misma capa)")
+                          + " cierreCortado=" + (sCloseCutTs != 0 && (now - sCloseCutTs) < 400)
+                          + " aperturaCortada=" + (sOpenFrac < 0.985f));
+              }
+
+              /** Detecta el inicio de un traspaso. Con la lock HO tomada. mv = {sx, sy, tx, ty} o null. */
+              private static void hoObserve(int key, SurfState st, float[] mv, long now) {
+                  boolean first = !st.seen;
+                  st.seen = true;
+                  if (sHoOn) {
+                      if (now - sHoStart > HANDOFF_MS + 60) endHandoff();
+                      else return;
+                  }
+                  if (sLast.ts == 0 || (now - sLast.ts) > 400 || !interruptContext(now)) return;
+                  if (first && sLast.key != key) {
+                      if (mv == null || differs(sLast, mv[0], mv[1], mv[2], mv[3])) armHandoff(-1, now);
+                  } else if (!first && sLast.key == key && mv != null && (now - sLast.ts) < 120
+                          && differs(sLast, mv[0], mv[1], mv[2], mv[3])) {
+                      armHandoff(key, now);
+                  }
+              }
+
+              private static float hoW(long now) {
+                  float t = (now - sHoStart) / (float) HANDOFF_MS;
+                  if (t <= 0f) return 0f;
+                  if (t >= 1f) return 1f;
+                  return t * t * (3f - 2f * t);
+              }
+
+              /** Mezcla v = {sx, sy, tx, ty} (pose pedida) con la pose de partida. */
+              private static void hoBlend(float[] v, long now) {
+                  float w = hoW(now);
+                  v[0] = sHoFrom.sx + (v[0] - sHoFrom.sx) * w;
+                  v[1] = sHoFrom.sy + (v[1] - sHoFrom.sy) * w;
+                  v[2] = sHoFrom.tx + (v[2] - sHoFrom.tx) * w;
+                  v[3] = sHoFrom.ty + (v[3] - sHoFrom.ty) * w;
+              }
+
+              /** Registra la pose de una ventana reducida (con recorte conocido) para un posible traspaso. */
+              private static void recordPose(int key, SurfState st, float[] v, long now) {
+                  if (st.cw <= 0f || v[0] >= 0.9995f || v[0] < 0.02f) return;
+                  if (now < st.frozenUntil) return;
+                  if (sLast.key != key && sLast.ts != 0 && (now - sLast.ts) < 120) return; // no robar la pista
+                  if (sLast.key == key && sLast.ts != 0 && (now - sLast.ts) < 120
+                          && differs(sLast, v[0], v[1], v[2], v[3]) && interruptContext(now)) {
+                      st.frozenUntil = now + 400; // salto del sistema (p. ej. end()): se conserva la pose previa
+                      return;
+                  }
+                  sLast.key = key;
+                  sLast.sx = v[0];
+                  sLast.sy = v[1];
+                  sLast.tx = v[2];
+                  sLast.ty = v[3];
+                  sLast.ts = now;
+              }
+
+              /** Matriz mezclada para esta capa, o null si no hay traspaso que aplicar. m9 = valores de la matriz pedida. */
+              private static Matrix hoMatrix(Object sc, float[] m9) {
+                  long now = SystemClock.uptimeMillis();
+                  int key = surfKey(sc);
+                  SurfState st = surf(sc);
+                  synchronized (HO) {
+                      float[] req = {m9[Matrix.MSCALE_X], m9[Matrix.MSCALE_Y], m9[Matrix.MTRANS_X], m9[Matrix.MTRANS_Y]};
+                      st.rsx = req[0];
+                      st.rsy = req[1];
+                      st.rtx = req[2];
+                      st.rty = req[3];
+                      st.rm = true;
+                      hoObserve(key, st, req, now);
+                      if (sHoOn && key == sHoKey) {
+                          if (now - sHoStart >= HANDOFF_MS) {
+                              endHandoff();
+                          } else {
+                              hoBlend(req, now);
+                              float[] o = m9.clone();
+                              o[Matrix.MSCALE_X] = req[0];
+                              o[Matrix.MSCALE_Y] = req[1];
+                              o[Matrix.MTRANS_X] = req[2];
+                              o[Matrix.MTRANS_Y] = req[3];
+                              Matrix m = new Matrix();
+                              m.setValues(o);
+                              recordPose(key, st, req, now);
+                              return m;
+                          }
+                      }
+                      recordPose(key, st, req, now);
+                  }
+                  return null;
+              }
+
+              /** Recorte mezclado para esta capa, o null. Elige la ventana destino: la primera capa nueva con recorte. */
+              private static Rect hoCrop(Object sc, Rect r) {
+                  long now = SystemClock.uptimeMillis();
+                  int key = surfKey(sc);
+                  SurfState st = surf(sc);
+                  synchronized (HO) {
+                      hoObserve(key, st, null, now);
+                      if (sHoOn && sHoKey == -1 && key != sHoFrom.key && !r.isEmpty() && (now - sHoStart) < 300) {
+                          sHoKey = key;
+                          st.fixMatrix = true;
+                          XposedBridge.log("[AnimHook] traspaso: ventana destino capa " + key);
+                      }
+                      if (sHoOn && key == sHoKey) {
+                          if (now - sHoStart >= HANDOFF_MS) {
+                              endHandoff();
+                          } else if (sHoFrom.hasC) {
+                              float w = hoW(now);
+                              return new Rect(
+                                      Math.round(sHoFrom.cl + (r.left - sHoFrom.cl) * w),
+                                      Math.round(sHoFrom.ct + (r.top - sHoFrom.ct) * w),
+                                      Math.round(sHoFrom.cr + (r.right - sHoFrom.cr) * w),
+                                      Math.round(sHoFrom.cb + (r.bottom - sHoFrom.cb) * w));
+                          }
+                      }
+                  }
+                  return null;
+              }
+
+              private static void hoSaveCrop(Object sc, Rect r) {
+                  SurfState st = surf(sc);
+                  synchronized (HO) {
+                      if (SystemClock.uptimeMillis() < st.frozenUntil) return;
+                      st.cl = r.left;
+                      st.ct = r.top;
+                      st.cr = r.right;
+                      st.cb = r.bottom;
+                      st.hasCrop = true;
+                  }
+              }
+
+              /** Si el recorte llegó antes que la matriz, repone la matriz mezclada de la ventana destino. */
+              private static void hoFixMatrix(Object tx, Object sc) {
+                  if (!SMOOTH_HANDOFF || sc == null || IN_HO.get() != null) return;
+                  SurfState st = surf(sc);
+                  Matrix m = null;
+                  synchronized (HO) {
+                      if (!st.fixMatrix) return;
+                      st.fixMatrix = false;
+                      if (!st.rm || !sHoOn) return;
+                      long now = SystemClock.uptimeMillis();
+                      float[] req = {st.rsx, st.rsy, st.rtx, st.rty};
+                      hoBlend(req, now);
+                      float[] o = {req[0], 0f, req[2], 0f, req[1], req[3], 0f, 0f, 1f};
+                      m = new Matrix();
+                      m.setValues(o);
+                  }
+                  IN_HO.set(Boolean.TRUE);
+                  try {
+                      XposedHelpers.callMethod(tx, "setMatrix", sc, m, new float[9]);
+                  } catch (Throwable t) {
+                      XposedBridge.log("[AnimHook] no pude reponer la matriz del traspaso: " + t);
+                  } finally {
+                      IN_HO.remove();
+                  }
+              }
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpp) {
+                  ClassLoader cl = lpp.classLoader;
+                  Class<?> qtm = XposedHelpers.findClassIfExists(QTM, cl);
+                  if (qtm == null) return; // este paquete no es el launcher
+
+                  sWindowRadius = systemWindowRadius();
+                  XposedBridge.log("[AnimHook] activo en " + lpp.packageName
+                          + " | POW=" + CORNER_POW + " MULT=" + CORNER_MULT
+                          + " OPEN=" + SPEED_OPEN + " CLOSE=" + SPEED_CLOSE
+                          + " R=" + sWindowRadius);
+                  hookDurations(qtm);
+                  hookWindowAnimatorEntryPoints(qtm);
+                  hookOpenRadius(cl);
+                  hookSpringClose(cl);
+                  if (SLOW_GESTURE_SPRING) hookSpringSpeed(cl);
+                  hookSurfaceCorners();
+                  hookInterrupt(cl);
+              }
+
+              /** Radio de las esquinas físicas de la pantalla (px). */
+              private static float systemWindowRadius() {
+                  try {
+                      Resources r = Resources.getSystem();
+                      int id = r.getIdentifier("rounded_corner_radius", "dimen", "android");
+                      if (id != 0) {
+                          float v = r.getDimension(id);
+                          if (v > 0f) return v;
+                      }
+                      return 28f * r.getDisplayMetrics().density;
+                  } catch (Throwable t) {
+                      return 0f;
+                  }
+              }
+
+              // ── Duraciones (apertura y cierre con botón/atrás) ─────────
+              private void hookDurations(Class<?> qtm) {
+                  XposedBridge.hookAllConstructors(qtm, new XC_MethodHook() {
+                      @Override
+                      protected void afterHookedMethod(MethodHookParam p) {
+                          try {
+                              if (APP_LAUNCH_MS > 0)
+                                  XposedHelpers.setLongField(p.thisObject, "mAppLaunchDuration", APP_LAUNCH_MS);
+                              if (CLOSE_MS > 0)
+                                  XposedHelpers.setIntField(p.thisObject, "mClosingTransitionDurationMs", CLOSE_MS);
+                          } catch (Throwable t) {
+                              XposedBridge.log(t);
+                          }
+                      }
+                  });
+              }
+
+              // ── Ventana de "cierre con botón/atrás" desde el manager ──
+              private void hookWindowAnimatorEntryPoints(Class<?> qtm) {
+                  Set<XC_MethodHook.Unhook> close = XposedBridge.hookAllMethods(qtm, "getClosingWindowAnimators",
+                          new XC_MethodHook() {
+                              @Override
+                              protected void beforeHookedMethod(MethodHookParam p) {
+                                  sBtnUntil = SystemClock.uptimeMillis() + CLOSE_MS + 1000;
+                                  sSessionStart = 0;
+                              }
+
+                              @Override
+                              protected void afterHookedMethod(MethodHookParam p) {
+                                  // Recuerda el animador de cierre para identificarlo luego (retroceso).
+                                  try {
+                                      Animator found = null;
+                                      if (p.getResult() instanceof Animator) found = (Animator) p.getResult();
+                                      for (Object a : p.args) {
+                                          if (a instanceof AnimatorSet) { found = (Animator) a; break; }
+                                      }
+                                      sCloseAnim = found == null ? null : new WeakReference<Animator>(found);
+                                  } catch (Throwable ignored) { }
+                              }
+                          });
+                  Set<XC_MethodHook.Unhook> open = XposedBridge.hookAllMethods(qtm, "getOpeningWindowAnimators",
+                          new XC_MethodHook() {
+                              @Override
+                              protected void beforeHookedMethod(MethodHookParam p) {
+                                  markCloseCut();
+                                  sBtnUntil = 0;
+                                  sBtnTs = 0;
+                                  sSessionStart = 0;
+                                  sCloseAnim = null;
+                              }
+                          });
+                  if (close.isEmpty())
+                      XposedBridge.log("[AnimHook] sin getClosingWindowAnimators (uso solo el listener de cierre)");
+                  if (open.isEmpty())
+                      XposedBridge.log("[AnimHook] sin getOpeningWindowAnimators");
+              }
+
+              // ── Apertura: curva del radio + detección de listeners ──
+              private void hookOpenRadius(ClassLoader cl) {
+                  Class<?> mvul = XposedHelpers.findClassIfExists(MVUL, cl);
+                  if (mvul == null) {
+                      XposedBridge.log("[AnimHook] no encontré " + MVUL);
+                      return;
+                  }
+                  Set<XC_MethodHook.Unhook> hooks = XposedBridge.hookAllMethods(mvul, "onAnimationUpdate",
+                          new XC_MethodHook() {
+                              @Override
+                              protected void beforeHookedMethod(MethodHookParam p) {
+                                  Object o = p.thisObject;
+                                  if (!o.getClass().getName().startsWith(QTM)) return;
+
+                                  trackButtonClose(o, p);
+                                  trackOpen(o, p);
+
+                                  if (!patched.add(o)) return; // una sola vez por animación
+
+                                  // FloatProp.mInterpolator es private final: setObjectField lo permite.
+                                  try {
+                                      Object prop = XposedHelpers.getObjectField(o, "mWindowRadius");
+                                      if (prop != null) {
+                                          XposedHelpers.setObjectField(prop, "mInterpolator", OPEN_CURVE);
+                                          try {
+                                              float end = XposedHelpers.getFloatField(prop, "mEnd");
+                                              if (end > 0f) sWindowRadius = end; // radio real de pantalla
+                                          } catch (Throwable ignored) { }
+                                      }
+                                  } catch (Throwable ignored) { }
+
+                                  try {
+                                      XposedHelpers.setObjectField(o, "cornerInterpolator", OPEN_CURVE);
+                                  } catch (Throwable ignored) { }
+                              }
+                          });
+                  if (hooks.isEmpty())
+                      XposedBridge.log("[AnimHook] no encontré onAnimationUpdate en " + MVUL);
+              }
+
+              /** Detecta el listener del cierre con botón/atrás (tiene val$windowCornerRadius y no mWindowRadius). */
+              private void trackButtonClose(Object listener, XC_MethodHook.MethodHookParam p) {
+                  Class<?> c = listener.getClass();
+                  Boolean isClose = closeListenerCache.get(c);
+                  if (isClose == null) {
+                      isClose = XposedHelpers.findFieldIfExists(c, "val$windowCornerRadius") != null
+                              && XposedHelpers.findFieldIfExists(c, "mWindowRadius") == null;
+                      closeListenerCache.put(c, isClose);
+                      if (isClose) {
+                          XposedBridge.log("[AnimHook] listener de cierre botón/atrás: " + c.getName());
+                          try {
+                              float r = XposedHelpers.getFloatField(listener, "val$windowCornerRadius");
+                              if (r > 0f) sWindowRadius = r;
+                          } catch (Throwable ignored) { }
+                      }
+                  }
+                  if (!isClose) return;
+                  sBtnTs = SystemClock.uptimeMillis();
+                  if (p.args.length > 0 && p.args[0] instanceof ValueAnimator)
+                      sBtnProg = ((ValueAnimator) p.args[0]).getAnimatedFraction();
+              }
+
+              /** Detecta el listener de apertura (tiene mWindowRadius) y guarda hasta dónde va. */
+              private void trackOpen(Object listener, XC_MethodHook.MethodHookParam p) {
+                  Class<?> c = listener.getClass();
+                  Boolean isOpen = openListenerCache.get(c);
+                  if (isOpen == null) {
+                      isOpen = XposedHelpers.findFieldIfExists(c, "mWindowRadius") != null;
+                      openListenerCache.put(c, isOpen);
+                  }
+                  if (!isOpen) return;
+                  if (p.args.length > 0 && p.args[0] instanceof ValueAnimator) {
+                      ValueAnimator va = (ValueAnimator) p.args[0];
+                      WeakReference<ValueAnimator> cur = sOpenAnim;
+                      if (cur == null || cur.get() != va) {
+                          sOpenAnim = new WeakReference<ValueAnimator>(va);
+                          sOpenStartTs = SystemClock.uptimeMillis();
+                          markCloseCut();
+                      }
+                      sOpenFrac = va.getAnimatedFraction();
+                      sOpenTs = SystemClock.uptimeMillis();
+                  }
+              }
+
+              // ── Cierre con gesto (resorte): sin saltos de 4 px + curva nueva ──
+              private void hookSpringClose(ClassLoader cl) {
+                  Class<?> spring = XposedHelpers.findClassIfExists(SPRING, cl);
+                  if (spring == null) {
+                      XposedBridge.log("[AnimHook] no encontré " + SPRING);
+                      return;
+                  }
+                  Set<XC_MethodHook.Unhook> hooks = XposedBridge.hookAllMethods(spring, "addOnUpdateListener",
+                          new XC_MethodHook() {
+                              @Override
+                              protected void beforeHookedMethod(MethodHookParam p) {
+                                  for (Object a : p.args) {
+                                      if (a == null) continue;
+                                      Class<?> c = a.getClass();
+                                      if (!c.getName().startsWith(QTM)) continue;
+                                      if (!hookedRunners.add(c)) continue;
+                                      hookRunner(c);
+                                  }
+                              }
+                          });
+                  if (hooks.isEmpty())
+                      XposedBridge.log("[AnimHook] no encontré addOnUpdateListener en " + SPRING);
+              }
+
+              private void hookRunner(Class<?> c) {
+                  try {
+                      // Solo la clase que tiene el radio con escalón de 4 px
+                      XposedHelpers.findField(c, "mLastCornerRadius");
+
+                      // 1) Antes de cada fotograma, "olvida" el último radio para que
+                      //    abs(mLastCornerRadius - cornerRadius) >= 4 siempre se cumpla.
+                      XposedHelpers.findAndHookMethod(c, "onUpdate", RectF.class, float.class,
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void beforeHookedMethod(MethodHookParam p) {
+                                      sGestureTs = SystemClock.uptimeMillis();
+                                      if (p.args.length > 1 && p.args[1] instanceof Float)
+                                          sGestureProg = (Float) p.args[1];
+                                      XposedHelpers.setFloatField(p.thisObject, "mLastCornerRadius", -1e9f);
+                                  }
+                              });
+
+                      // 2) Sustituye CORNER_LEAD_INTERPOLATOR por la curva ajustable.
+                      XposedHelpers.findAndHookMethod(c, "getCornerRadius", float.class,
+                              new XC_MethodHook() {
+                                  @Override
+                                  protected void afterHookedMethod(MethodHookParam p) {
+                                      float f = (Float) p.args[0];
+                                      float s = XposedHelpers.getFloatField(p.thisObject, "mStartRadius");
+                                      float e = XposedHelpers.getFloatField(p.thisObject, "mEndRadius");
+                                      p.setResult(s + closeProgress(f) * (e - s));
+                                  }
+                              });
+
+                      XposedBridge.log("[AnimHook] cierre por gesto enganchado en " + c.getName());
+                  } catch (Throwable t) {
+                      // No era la clase buscada (o cambió el nombre de algún método)
+                  }
+              }
+
+              // ── Velocidad del resorte del cierre con gesto ─────────────
+              private void hookSpringSpeed(ClassLoader cl) {
+                  Class<?> spring = XposedHelpers.findClassIfExists(SPRING, cl);
+                  Class<?> force = XposedHelpers.findClassIfExists(SPRING_FORCE, cl);
+                  if (spring == null || force == null) {
+                      XposedBridge.log("[AnimHook] sin RectFSpringAnim/SpringForce: el resorte del gesto no se ralentiza");
+                      return;
+                  }
+                  // La duración de un resorte escala con 1/sqrt(rigidez): rigidez / K² => tiempo x K.
+                  XposedBridge.hookAllMethods(force, "setStiffness", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          if (!Boolean.TRUE.equals(IN_SPRING.get())) return;
+                          if (p.args.length == 1 && p.args[0] instanceof Float)
+                              p.args[0] = ((Float) p.args[0]) / (SPEED_CLOSE * SPEED_CLOSE);
+                      }
+                  });
+                  XC_MethodHook flag = new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) { IN_SPRING.set(true); }
+
+                      @Override
+                      protected void afterHookedMethod(MethodHookParam p) { IN_SPRING.remove(); }
+                  };
+                  XposedBridge.hookAllConstructors(spring, flag);
+                  XposedBridge.hookAllMethods(spring, "start", flag);
+              }
+
+              // ── Esquinas en TODAS las superficies que mueve el launcher ──
+              // Punto único: SurfaceControl.Transaction. Aquí se aplica:
+              //   * cierre botón/atrás: radio animado (R0 -> pastilla, curva espejo),
+              //   * el resto (apertura, gesto, recientes, mantener presionado): radio x CORNER_MULT
+              //     y nunca por debajo del mínimo mientras la ventana está reducida,
+              //   * si el sistema no fija radio (esquinas filosas), se inyecta uno.
+              private void hookSurfaceCorners() {
+                  Class<?> tx = XposedHelpers.findClassIfExists("android.view.SurfaceControl$Transaction", null);
+                  if (tx == null) {
+                      XposedBridge.log("[AnimHook] no encontré SurfaceControl.Transaction");
+                      return;
+                  }
+
+                  XposedBridge.hookAllMethods(tx, "setMatrix", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          try {
+                              float s = -1f;
+                              if (p.args.length >= 2 && p.args[1] instanceof Matrix) {
+                                  float[] v = new float[9];
+                                  ((Matrix) p.args[1]).getValues(v);
+                                  if (SMOOTH_HANDOFF && IN_HO.get() == null
+                                          && Math.abs(v[Matrix.MSKEW_X]) < 1e-3f
+                                          && Math.abs(v[Matrix.MSKEW_Y]) < 1e-3f) {
+                                      Matrix hm = hoMatrix(p.args[0], v);
+                                      if (hm != null) {
+                                          p.args[1] = hm;
+                                          hm.getValues(v);
+                                      }
+                                  }
+                                  s = (float) Math.hypot(v[Matrix.MSCALE_X], v[Matrix.MSKEW_Y]);
+                              } else if (p.args.length == 5 && p.args[1] instanceof Float) {
+                                  s = (float) Math.hypot((Float) p.args[1], (Float) p.args[2]);
+                              }
+                              if (s > 0.01f) {
+                                  sScale = s;
+                                  surf(p.args[0]).scale = s;
+                              }
+                          } catch (Throwable ignored) { }
+                      }
+
+                      @Override
+                      protected void afterHookedMethod(MethodHookParam p) {
+                          try {
+                              if (p.args.length >= 1) injectCorner(p.thisObject, p.args[0]);
+                          } catch (Throwable ignored) { }
+                      }
+                  });
+
+                  XC_MethodHook crop = new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          try {
+                              float w = -1f, h = -1f;
+                              if (SMOOTH_HANDOFF && IN_HO.get() == null
+                                      && p.args.length >= 2 && p.args[1] instanceof Rect) {
+                                  Rect hr = hoCrop(p.args[0], (Rect) p.args[1]);
+                                  if (hr != null) p.args[1] = hr;
+                              }
+                              if (p.args.length >= 2 && p.args[1] instanceof Rect) {
+                                  Rect r = (Rect) p.args[1];
+                                  w = r.width();
+                                  h = r.height();
+                                  hoSaveCrop(p.args[0], r);
+                              } else if (p.args.length >= 2 && p.args[1] instanceof RectF) {
+                                  RectF r = (RectF) p.args[1];
+                                  w = r.width();
+                                  h = r.height();
+                              } else if (p.args.length == 3 && p.args[1] instanceof Integer) {
+                                  w = (Integer) p.args[1];
+                                  h = (Integer) p.args[2];
+                              }
+                              if (w >= 0f) {
+                                  sCropW = w;
+                                  sCropH = h;
+                                  SurfState st = surf(p.args[0]);
+                                  st.cw = w;
+                                  st.ch = h;
+                              }
+                          } catch (Throwable ignored) { }
+                      }
+
+                      @Override
+                      protected void afterHookedMethod(MethodHookParam p) {
+                          try {
+                              if (p.args.length >= 1) {
+                                  hoFixMatrix(p.thisObject, p.args[0]);
+                                  injectCorner(p.thisObject, p.args[0]);
+                              }
+                          } catch (Throwable ignored) { }
+                      }
+                  };
+                  XposedBridge.hookAllMethods(tx, "setWindowCrop", crop);
+                  XposedBridge.hookAllMethods(tx, "setCrop", crop);
+
+                  XposedBridge.hookAllMethods(tx, "setCornerRadius", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          try {
+                              if (IN_INJECT.get() != null) return; // nuestra propia inyección
+                              if (p.args.length != 2 || !(p.args[1] instanceof Float)) return;
+                              float orig = (Float) p.args[1];
+                              SurfState st = surf(p.args[0]);
+                              st.radiusTs = SystemClock.uptimeMillis();
+                              st.lastOrig = orig;
+                              float v = buttonCloseRadius(orig);
+                              if (v < 0f) v = generalRadius(st, orig);
+                              p.args[1] = v;
+                              if (!st.loggedSys && st.scale < 0.9995f) {
+                                  st.loggedSys = true;
+                                  XposedBridge.log("[AnimHook] sistema fija radio=" + orig + " -> " + v
+                                          + " escala=" + st.scale + " capa=" + surfKey(p.args[0]));
+                              }
+                          } catch (Throwable ignored) { }
+                      }
+                  });
+              }
+
+              /**
+               * Radio local para cualquier superficie: x CORNER_MULT y, si la ventana está reducida,
+               * nunca menor que min(pastilla, radio de pantalla x CORNER_MULT).
+               */
+              private static float generalRadius(SurfState st, float orig) {
+                  float local = orig * CORNER_MULT;
+                  float s = st.scale;
+                  if (!CORNER_FLOOR || s >= 0.9995f || s < 0.02f) return local;
+                  float floor = sWindowRadius * CORNER_MULT;
+                  float pill = Float.MAX_VALUE;                       // sin recorte conocido: sin tope
+                  if (st.cw > 0f && st.ch > 0f) pill = Math.min(st.cw, st.ch) * s / 2f;
+                  floor = Math.min(pill, floor);
+                  float vis = Math.min(Math.max(local * s, floor), pill);
+                  return vis / s;
+              }
+
+              /**
+               * Pone el radio mínimo en superficies reducidas (recientes, mantener presionado...).
+               * Se llama tras setMatrix y setWindowCrop: da igual en qué orden aplique el sistema su propio
+               * radio, porque el del sistema también pasa por aquí y nunca baja del mínimo.
+               */
+              private static void injectCorner(Object tx, Object sc) {
+                  if (!CORNER_FLOOR || sc == null || IN_INJECT.get() != null) return;
+                  long now = SystemClock.uptimeMillis();
+                  // Cierre botón/atrás activo: su radio animado lo calcula buttonCloseRadius.
+                  if ((now - sBtnTs) < 80 || (sSessionStart != 0 && (now - sLastCall) < 250)) return;
+                  SurfState st = surf(sc);
+                  if (st.scale >= 0.9995f || st.scale < 0.02f) return;
+                  float r = generalRadius(st, st.lastOrig);
+                  if (r <= 0f) return;
+                  IN_INJECT.set(Boolean.TRUE);
+                  try {
+                      XposedHelpers.callMethod(tx, "setCornerRadius", sc, r);
+                      if (!st.logged) {
+                          st.logged = true;
+                          XposedBridge.log("[AnimHook] esquinas aplicadas: escala=" + st.scale
+                                  + " radio=" + r + " (sistema=" + st.lastOrig + ")");
+                      }
+                  } catch (Throwable t) {
+                      if (!st.logged) {
+                          st.logged = true;
+                          XposedBridge.log("[AnimHook] no pude fijar radio: " + t);
+                      }
+                  } finally {
+                      IN_INJECT.remove();
+                  }
+              }
+
+              /** Radio local a aplicar durante el cierre con botón/atrás, o -1 si no hay cierre activo. */
+              private static float buttonCloseRadius(float original) {
+                  long now = SystemClock.uptimeMillis();
+
+                  // El cierre con gesto ya lo resuelve hookRunner: no tocarlo aquí.
+                  if (now - sGestureTs < 80) { sSessionStart = 0; return -1f; }
+
+                  boolean strong = (now - sBtnTs) < 80;   // vemos el listener real: progreso exacto
+                  boolean weak = now < sBtnUntil;         // respaldo: progreso por tiempo
+                  if (!strong && !weak) { sSessionStart = 0; return -1f; }
+                  if (sCropW <= 0f || sCropH <= 0f) return -1f;
+
+                  if (sSessionStart == 0 || (now - sLastCall) > 250) {
+                      sSessionStart = now;
+                      sR0 = original * Math.max(sScale, 0.05f) * CORNER_MULT; // radio visible inicial (ya hecho)
+                  }
+                  sLastCall = now;
+
+                  float p;
+                  if (strong) {
+                      p = sBtnProg;
+                  } else {
+                      long el = now - sSessionStart;
+                      if (el > CLOSE_MS + 150L) return -1f;
+                      p = el / (float) CLOSE_MS;
+                  }
+
+                  float s = Math.max(sScale, 0.05f);
+                  float pill = Math.min(sCropW * s, sCropH * s) / 2f;     // radio que deja pastilla/círculo
+                  float vis = sR0 + (pill - sR0) * closeProgress(p);      // curva espejo
+                  vis = Math.max(0f, Math.min(vis, pill));
+                  return vis / s; // el radio se aplica antes de la matriz de escala
+              }
+
+              // ── Interrupción: cerrar mientras abre => retroceder, no saltar ──
+              private void hookInterrupt(ClassLoader cl) {
+                  if (!REVERSE_ON_INTERRUPT) return;
+
+                  // 1) Cuando el sistema cancela la apertura, el launcher llama AnimatorSet.end(), que
+                  //    salta al último fotograma (app a pantalla completa). Se sustituye por cancel():
+                  //    la animación se queda donde iba.
+                  try {
+                      XposedHelpers.findAndHookMethod(AnimatorSet.class, "end", new XC_MethodHook() {
+                          @Override
+                          protected void beforeHookedMethod(MethodHookParam p) {
+                              try {
+                                  if (!openInProgress()) return;
+                                  WeakReference<ValueAnimator> ref = sOpenAnim;
+                                  ValueAnimator va = ref == null ? null : ref.get();
+                                  AnimatorSet set = (AnimatorSet) p.thisObject;
+                                  if (va == null || !set.isRunning() || !contains(set, va, 0)) return;
+                                  set.cancel();
+                                  p.setResult(null);
+                                  XposedBridge.log("[AnimHook] apertura interrumpida en " + sOpenFrac
+                                          + ": sin salto al final");
+                              } catch (Throwable t) {
+                                  XposedBridge.log(t);
+                              }
+                          }
+                      });
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+
+                  // 2) El cierre que viene después arranca desde donde iba la apertura.
+                  Class<?> ar = XposedHelpers.findClassIfExists(ANIM_RESULT, cl);
+                  if (ar != null) {
+                      Set<XC_MethodHook.Unhook> h = XposedBridge.hookAllMethods(ar, "setAnimation", new XC_MethodHook() {
+                          @Override
+                          protected void afterHookedMethod(MethodHookParam p) {
+                              for (Object a : p.args) {
+                                  if (a instanceof AnimatorSet) applyReverseOffset((AnimatorSet) a);
+                              }
+                          }
+                      });
+                      if (h.isEmpty()) XposedBridge.log("[AnimHook] sin setAnimation en " + ANIM_RESULT);
+                  } else {
+                      XposedBridge.log("[AnimHook] sin " + ANIM_RESULT + ": uso AnimatorSet.start como respaldo");
+                      try {
+                          XposedHelpers.findAndHookMethod(AnimatorSet.class, "start", new XC_MethodHook() {
+                              @Override
+                              protected void afterHookedMethod(MethodHookParam p) {
+                                  applyReverseOffset((AnimatorSet) p.thisObject);
+                              }
+                          });
+                      } catch (Throwable t) {
+                          XposedBridge.log(t);
+                      }
+                  }
+              }
+
+              private static boolean openInProgress() {
+                  return sOpenAnim != null
+                          && (SystemClock.uptimeMillis() - sOpenTs) < 150
+                          && sOpenFrac < 0.985f;
+              }
+
+              private static boolean contains(Animator root, Animator target, int depth) {
+                  if (root == target) return true;
+                  if (depth > 6 || !(root instanceof AnimatorSet)) return false;
+                  for (Animator c : ((AnimatorSet) root).getChildAnimations()) {
+                      if (contains(c, target, depth + 1)) return true;
+                  }
+                  return false;
+              }
+
+              /** Si este es el animador de cierre y la apertura quedó a medias, empieza el cierre ya avanzado. */
+              private static void applyReverseOffset(AnimatorSet set) {
+                  try {
+                      long now = SystemClock.uptimeMillis();
+                      if (sOpenTs == 0 || now - sOpenTs > 500 || sOpenFrac >= 0.985f) return;
+
+                      WeakReference<Animator> ref = sCloseAnim;
+                      Animator closing = ref == null ? null : ref.get();
+                      boolean isClosing = closing != null ? contains(set, closing, 0) : now < sBtnUntil;
+                      if (!isClosing) return;
+
+                      long total = set.getTotalDuration();
+                      if (total <= 0) return;
+
+                      float frac = sOpenFrac;
+                      sOpenTs = 0; // consumido
+                      long t = Math.round((1f - frac) * total);
+                      set.setCurrentPlayTime(Math.max(0L, Math.min(t, total - 1)));
+                      XposedBridge.log("[AnimHook] cierre retoma desde " + (1f - frac) + " (apertura iba en " + frac + ")");
+                  } catch (Throwable t) {
+                      XposedBridge.log(t);
+                  }
+              }
+          }
+          END_FILE_6
+      - name: Compilar
+        working-directory: proj
+        run: |
+          find . -type f | head -30
+          gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LauncherAnim-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
