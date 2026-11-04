@@ -104,6 +104,7 @@ jobs:
 
           import java.lang.ref.WeakReference;
           import java.util.Collections;
+          import java.util.HashSet;
           import java.util.LinkedHashMap;
           import java.util.Map;
           import java.util.Set;
@@ -232,6 +233,7 @@ jobs:
                   int cl, ct, cr, cb;                   // último recorte aplicado
                             float px = 1f, py = 1f, ptx = 0f, pty = 0f; // última matriz (escala/posición)
                             long poseTs = 0;
+                            WeakReference<Object> ref = null;   // la SurfaceControl de esta capa
               }
 
               // Clave = id de capa (o identidad si no hay): no depende de que sea el mismo objeto Java.
@@ -286,6 +288,14 @@ jobs:
               private static final ThreadLocal<Boolean> IN_HO = new ThreadLocal<>();
               private static float sMinDim = 0f;
               private static volatile int sDiagLeft = 0;  // diagnóstico: fotogramas a registrar tras iniciar el gesto
+              // Traspaso inmediato del gesto: capas (leash) de la app en la animación de recientes.
+              private static final Set<Integer> sPendKeys = Collections.synchronizedSet(new HashSet<Integer>());
+              private static boolean sHoPend = false;
+              private static long sHoPendTs = 0;
+              private static boolean sHoHideOld = false;   // ocultar la capa vieja (apertura congelada)
+              private static boolean sHoHidden = false;
+              private static int sHoFrames = 0;
+              private static volatile long sGestOpenTs = 0;  // onGestureStarted llegó con la apertura a medias
 
               private static float minDim() {
                   if (sMinDim <= 0f) {
@@ -310,8 +320,9 @@ jobs:
               /** Hay una animación a medias que acaba de ser interrumpida (cierre cortado o apertura que dejó de avanzar). */
               private static boolean interruptContext(long now) {
                   boolean closeCut = sCloseCutTs != 0 && (now - sCloseCutTs) < 400;
+                  boolean gestCut = sGestOpenTs != 0 && (now - sGestOpenTs) < 400;
                   boolean openCut = sOpenTs != 0 && sOpenFrac < 0.985f
-                          && (now - sOpenTs) < 250 && (now - sOpenStartTs) > 150;
+                          && (now - sOpenTs) < 250 && ((now - sOpenStartTs) > 150 || gestCut);
                   return closeCut || openCut;
               }
 
@@ -328,6 +339,7 @@ jobs:
               }
 
               private static void armHandoff(int key, long now) {
+                  sHoHideOld = false;
                   sHoFrom.sx = sLast.sx;
                   sHoFrom.sy = sLast.sy;
                   sHoFrom.tx = sLast.tx;
@@ -356,13 +368,22 @@ jobs:
                   boolean first = !st.seen;
                   st.seen = true;
                             if (now < sBtnUntil) return; // cierre botón/atrás: lo resuelve startCloseFromOpenPose
+                            if (sHoPend && now - sHoPendTs < 150 && sPendKeys.contains(key)) return; // gesto: lo resuelve hoPending
                   if (sHoOn) {
                       if (now - sHoStart > HANDOFF_MS + 60) endHandoff();
                       else return;
                   }
                   if (sLast.ts == 0 || (now - sLast.ts) > 400 || !interruptContext(now)) return;
                   if (first && sLast.key != key) {
-                      if (mv == null || differs(sLast, mv[0], mv[1], mv[2], mv[3])) armHandoff(-1, now);
+                      if (mv == null || differs(sLast, mv[0], mv[1], mv[2], mv[3])) {
+                          boolean g = sGestOpenTs != 0 && (now - sGestOpenTs) < 400;
+                          armHandoff(-1, now);
+                          sHoHideOld = g;      // gesto sobre apertura: la capa vieja queda congelada debajo
+                          sHoHidden = false;
+                          sHoFrames = 0;
+                          if (g) XposedBridge.log("[AnimHook] traspaso inmediato (ruta de respaldo): capa nueva " + key
+                                  + " ms desde onGestureStarted=" + (now - sGestOpenTs));
+                      }
                   } else if (!first && sLast.key == key && mv != null && (now - sLast.ts) < 120
                           && differs(sLast, mv[0], mv[1], mv[2], mv[3])) {
                       armHandoff(key, now);
@@ -415,7 +436,8 @@ jobs:
                       st.rtx = req[2];
                       st.rty = req[3];
                       st.rm = true;
-                      hoObserve(key, st, req, now);
+                      hoPending(key, now);
+                                hoObserve(key, st, req, now);
                       if (sHoOn && key == sHoKey) {
                           if (now - sHoStart >= HANDOFF_MS) {
                               endHandoff();
@@ -443,7 +465,8 @@ jobs:
                   int key = surfKey(sc);
                   SurfState st = surf(sc);
                   synchronized (HO) {
-                      hoObserve(key, st, null, now);
+                      hoPending(key, now);
+                                hoObserve(key, st, null, now);
                       if (sHoOn && sHoKey == -1 && key != sHoFrom.key && !r.isEmpty() && (now - sHoStart) < 300) {
                           sHoKey = key;
                           st.fixMatrix = true;
@@ -510,7 +533,7 @@ jobs:
                   if (qtm == null) return; // este paquete no es el launcher
 
                   sWindowRadius = systemWindowRadius();
-                  XposedBridge.log("[AnimHook] activo en " + lpp.packageName
+                  XposedBridge.log("[AnimHook] activo en " + lpp.packageName + " | build=gestfix2"
                           + " | POW=" + CORNER_POW + " MULT=" + CORNER_MULT
                           + " OPEN=" + SPEED_OPEN + " CLOSE=" + SPEED_CLOSE
                           + " R=" + sWindowRadius);
@@ -806,6 +829,7 @@ jobs:
                                           ps.ptx = v[Matrix.MTRANS_X];
                                           ps.pty = v[Matrix.MTRANS_Y];
                                           ps.poseTs = SystemClock.uptimeMillis();
+                                          ps.ref = new WeakReference<Object>(p.args[0]);
                                           if (sDiagLeft > 0) {
                                               sDiagLeft--;
                                               XposedBridge.log("[AnimHook] DIAG matriz capa=" + surfKey(p.args[0])
@@ -1101,7 +1125,12 @@ jobs:
                   @Override
                   protected void beforeHookedMethod(MethodHookParam p) {
                       long now = SystemClock.uptimeMillis();
-                      sDiagLeft = 24;
+                      sDiagLeft = 12;
+                      if ("onGestureStarted".equals(p.method.getName())) {
+                          boolean op = sOpenTs != 0 && sOpenFrac < 0.985f && (now - sOpenTs) < 250;
+                          sGestOpenTs = op ? now : 0;
+                      }
+                      if ("onRecentsAnimationStart".equals(p.method.getName())) armGestureHandoff(p, now);
                       XposedBridge.log("[AnimHook] DIAG " + p.method.getName() + ": aperturaFrac=" + sOpenFrac
                               + " msDesdeFotogramaApertura=" + (sOpenTs == 0 ? -1 : now - sOpenTs)
                               + " msDesdeInicioApertura=" + (sOpenStartTs == 0 ? -1 : now - sOpenStartTs));
@@ -1109,6 +1138,88 @@ jobs:
               };
               XposedBridge.hookAllMethods(h, "onGestureStarted", d);
               XposedBridge.hookAllMethods(h, "onRecentsAnimationStart", d);
+          }
+          /**
+           * Gesto iniciado durante la apertura: al llegar el PRIMER fotograma de la capa de la app del gesto, el traspaso
+           * arranca desde la última pose de la apertura (antes se armaba ~50 ms tarde, y esos primeros fotogramas salían a
+           * pantalla completa). Pasados 3 fotogramas se oculta la capa vieja de la apertura, que quedaba congelada debajo.
+           */
+          private static void hoPending(int key, long now) {
+              if (sHoPend && now - sHoPendTs > 600) sHoPend = false;
+              if (sHoPend && sPendKeys.contains(key)) {
+                  sHoPend = false;
+                  if (sLast.ts != 0 && now - sLast.ts < 400 && sLast.key != key) {
+                      armHandoff(key, now);
+                      sHoHideOld = true;
+                      sHoHidden = false;
+                      sHoFrames = 0;
+                      XposedBridge.log("[AnimHook] traspaso inmediato del gesto: capa " + key + " desde la pose de la apertura");
+                  }
+              }
+              if (sHoOn && sHoHideOld && !sHoHidden && key == sHoKey && ++sHoFrames >= 3) {
+                  sHoHidden = true;
+                  hideOldLeash(sHoFrom.key);
+              }
+          }
+
+          private static void hideOldLeash(int oldKey) {
+              try {
+                  SurfState old = SURF.get(oldKey);
+                  Object sc = (old == null || old.ref == null) ? null : old.ref.get();
+                  Class<?> txc = XposedHelpers.findClassIfExists("android.view.SurfaceControl$Transaction", null);
+                  if (sc == null || txc == null) return;
+                  Object t = XposedHelpers.newInstance(txc);
+                  try {
+                      XposedHelpers.callMethod(t, "setAlpha", sc, 0f);
+                      XposedHelpers.callMethod(t, "apply");
+                  } finally {
+                      try { XposedHelpers.callMethod(t, "close"); } catch (Throwable ignored) { }
+                  }
+                  XposedBridge.log("[AnimHook] capa vieja de la apertura oculta: " + oldKey);
+              } catch (Throwable t) {
+                  XposedBridge.log("[AnimHook] no pude ocultar la capa vieja: " + t);
+              }
+          }
+
+          /** onRecentsAnimationStart(controller, targets, info): si la apertura iba a medias, deja listo el traspaso. */
+          private static void armGestureHandoff(XC_MethodHook.MethodHookParam p, long now) {
+              try {
+                  if (!SMOOTH_HANDOFF) return;
+                  boolean opening = sOpenTs != 0 && sOpenFrac < 0.985f && (now - sOpenTs) < 250;
+                  if (!opening) return;
+                  if (p.args.length < 2 || p.args[1] == null) {
+                      XposedBridge.log("[AnimHook] armGestureHandoff: args=" + p.args.length + " args[1]="
+                              + (p.args.length < 2 || p.args[1] == null ? "null" : p.args[1].getClass().getName()));
+                      return;
+                  }
+                  Object apps = XposedHelpers.getObjectField(p.args[1], "apps");
+                  if (!(apps instanceof Object[])) {
+                      XposedBridge.log("[AnimHook] armGestureHandoff: apps no es array: "
+                              + (apps == null ? "null" : apps.getClass().getName()) + " en " + p.args[1].getClass().getName());
+                      return;
+                  }
+                  StringBuilder sb = new StringBuilder();
+                  sPendKeys.clear();
+                  for (Object a : (Object[]) apps) {
+                      if (a == null) continue;
+                      Object leash = XposedHelpers.getObjectField(a, "leash");
+                      if (leash == null) continue;
+                      int k = surfKey(leash);
+                      sPendKeys.add(k);
+                      sb.append(k).append(' ');
+                  }
+                  if (sPendKeys.isEmpty()) {
+                      XposedBridge.log("[AnimHook] armGestureHandoff: apps=" + ((Object[]) apps).length + " sin leash");
+                      return;
+                  }
+                  synchronized (HO) {
+                      sHoPend = true;
+                      sHoPendTs = now;
+                  }
+                  XposedBridge.log("[AnimHook] gesto durante la apertura (frac=" + sOpenFrac + "): capas de la app = " + sb);
+              } catch (Throwable t) {
+                  XposedBridge.log(t);
+              }
           }
               private static boolean openInProgress() {
                   return sOpenAnim != null
