@@ -1,0 +1,226 @@
+name: Build ColorOS17 Anim
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Crear proyecto
+        run: |
+          mkdir -p proj && cd proj
+          cat > settings.gradle <<'END_0'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url 'https://api.xposed.info/' }
+              }
+          }
+          rootProject.name = "ColorOS17Anim"
+          include ':app'
+          END_0
+          cat > build.gradle <<'END_1'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          END_1
+          cat > gradle.properties <<'END_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          END_2
+          mkdir -p app
+          cat > app/build.gradle <<'END_3'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.alex.coloros17'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.alex.coloros17'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+
+          dependencies {
+              compileOnly 'de.robv.android.xposed:api:82'
+          }
+          END_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'END_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="ColorOS 17 Anim"
+                  android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Animacion de entrada estilo ColorOS 17 a nivel sistema" />
+                  <meta-data android:name="xposedminversion" android:value="82" />
+              </application>
+          </manifest>
+          END_4
+          mkdir -p app/src/main/assets
+          cat > app/src/main/assets/xposed_init <<'END_5'
+          com.alex.coloros17.MainHook
+          END_5
+          mkdir -p app/src/main/java/com/alex/coloros17
+          cat > app/src/main/java/com/alex/coloros17/MainHook.java <<'END_6'
+          package com.alex.coloros17;
+
+          import android.view.animation.AccelerateDecelerateInterpolator;
+          import android.view.animation.AlphaAnimation;
+          import android.view.animation.Animation;
+          import android.view.animation.AnimationSet;
+          import android.view.animation.Interpolator;
+          import android.view.animation.PathInterpolator;
+          import android.view.animation.ScaleAnimation;
+
+          import java.lang.reflect.Field;
+          import java.util.HashMap;
+          import java.util.Map;
+
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
+
+          /**
+           * Base hook: reemplaza las animaciones de transición de apps a nivel sistema.
+           * Scope en LSPosed: "Android" (system_server) y "System UI".
+           * Punto de enganche: com.android.internal.policy.TransitionAnimation (framework),
+           * que carga las animaciones de apertura/cierre de actividades y tasks.
+           */
+          public class MainHook implements IXposedHookLoadPackage {
+
+              private static final String TAG = "[ColorAnim] ";
+
+              // ---- Parámetros ajustables (estilo ColorOS 17, aproximado) ----
+              private static final long DURATION = 420L;
+              private static final float OPEN_ENTER_FROM = 0.88f;   // app que entra
+              private static final float OPEN_EXIT_TO = 0.96f;      // app que sale hacia atrás
+              private static final float CLOSE_ENTER_FROM = 0.96f;  // app que vuelve
+              private static final float CLOSE_EXIT_TO = 0.88f;     // app que se cierra
+              private static final Interpolator CURVE = new PathInterpolator(0.2f, 0f, 0f, 1f);
+
+              private static final int OPEN_ENTER = 0, OPEN_EXIT = 1, CLOSE_ENTER = 2, CLOSE_EXIT = 3;
+              private final Map<Integer, Integer> attrKind = new HashMap<>();
+
+              @Override
+              public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
+                  if (!"android".equals(lpparam.packageName)
+                          && !"com.android.systemui".equals(lpparam.packageName)) return;
+
+                  try {
+                      mapAttrs(lpparam.classLoader);
+                      Class<?> ta = Class.forName(
+                              "com.android.internal.policy.TransitionAnimation", false, lpparam.classLoader);
+
+                      XC_MethodHook hook = new XC_MethodHook() {
+                          @Override
+                          protected void afterHookedMethod(MethodHookParam param) {
+                              try {
+                                  Integer attr = null;
+                                  for (Object a : param.args) {
+                                      if (a instanceof Integer) { attr = (Integer) a; break; } // primer int = animAttr
+                                  }
+                                  if (attr == null) return;
+                                  Integer kind = attrKind.get(attr);
+                                  if (kind == null) return;
+                                  param.setResult(build(kind));
+                              } catch (Throwable t) {
+                                  XposedBridge.log(TAG + "hook error: " + t);
+                              }
+                          }
+                      };
+
+                      int n = XposedBridge.hookAllMethods(ta, "loadAnimationAttr", hook).size();
+                      n += XposedBridge.hookAllMethods(ta, "loadDefaultAnimationAttr", hook).size();
+                      XposedBridge.log(TAG + lpparam.packageName + ": " + n + " métodos enganchados");
+                  } catch (Throwable t) {
+                      XposedBridge.log(TAG + "init error en " + lpparam.packageName + ": " + t);
+                  }
+              }
+
+              /** Mapea los índices de WindowAnimation_* a nuestro tipo de animación. */
+              private void mapAttrs(ClassLoader cl) throws Throwable {
+                  Class<?> styleable = Class.forName("com.android.internal.R$styleable", false, cl);
+                  put(styleable, "WindowAnimation_activityOpenEnterAnimation", OPEN_ENTER);
+                  put(styleable, "WindowAnimation_activityOpenExitAnimation", OPEN_EXIT);
+                  put(styleable, "WindowAnimation_activityCloseEnterAnimation", CLOSE_ENTER);
+                  put(styleable, "WindowAnimation_activityCloseExitAnimation", CLOSE_EXIT);
+                  put(styleable, "WindowAnimation_taskOpenEnterAnimation", OPEN_ENTER);
+                  put(styleable, "WindowAnimation_taskOpenExitAnimation", OPEN_EXIT);
+                  put(styleable, "WindowAnimation_taskCloseEnterAnimation", CLOSE_ENTER);
+                  put(styleable, "WindowAnimation_taskCloseExitAnimation", CLOSE_EXIT);
+                  put(styleable, "WindowAnimation_taskToFrontEnterAnimation", OPEN_ENTER);
+                  put(styleable, "WindowAnimation_taskToFrontExitAnimation", OPEN_EXIT);
+                  put(styleable, "WindowAnimation_taskToBackEnterAnimation", CLOSE_ENTER);
+                  put(styleable, "WindowAnimation_taskToBackExitAnimation", CLOSE_EXIT);
+              }
+
+              private void put(Class<?> c, String field, int kind) {
+                  try {
+                      Field f = c.getField(field);
+                      attrKind.put(f.getInt(null), kind);
+                  } catch (Throwable ignored) { /* no existe en esta versión */ }
+              }
+
+              private Animation build(int kind) {
+                  float from, to, a0, a1;
+                  switch (kind) {
+                      case OPEN_ENTER:  from = OPEN_ENTER_FROM;  to = 1f;             a0 = 0f;   a1 = 1f; break;
+                      case OPEN_EXIT:   from = 1f;               to = OPEN_EXIT_TO;   a0 = 1f;   a1 = 0.6f; break;
+                      case CLOSE_ENTER: from = CLOSE_ENTER_FROM; to = 1f;             a0 = 0.6f; a1 = 1f; break;
+                      default:          from = 1f;               to = CLOSE_EXIT_TO;  a0 = 1f;   a1 = 0f; break;
+                  }
+                  AnimationSet set = new AnimationSet(false);
+
+                  ScaleAnimation scale = new ScaleAnimation(from, to, from, to,
+                          Animation.RELATIVE_TO_SELF, 0.5f, Animation.RELATIVE_TO_SELF, 0.5f);
+                  scale.setInterpolator(CURVE);
+                  scale.setDuration(DURATION);
+
+                  AlphaAnimation alpha = new AlphaAnimation(a0, a1);
+                  alpha.setInterpolator(new AccelerateDecelerateInterpolator());
+                  alpha.setDuration(kind == OPEN_ENTER ? DURATION / 2 : DURATION);
+
+                  set.addAnimation(scale);
+                  set.addAnimation(alpha);
+                  set.setDuration(DURATION);
+                  set.setFillAfter(true);
+                  return set;
+              }
+          }
+          END_6
+      - name: Compilar
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ColorOS17Anim-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
