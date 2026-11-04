@@ -295,6 +295,7 @@ jobs:
               private static boolean sHoHideOld = false;   // ocultar la capa vieja (apertura congelada)
               private static boolean sHoHidden = false;
               private static int sHoFrames = 0;
+              private static int sHoLogLeft = 0;   // diagnóstico: fotogramas del traspaso con pose pedida vs aplicada
               private static volatile long sGestOpenTs = 0;  // onGestureStarted llegó con la apertura a medias
 
               private static float minDim() {
@@ -320,9 +321,8 @@ jobs:
               /** Hay una animación a medias que acaba de ser interrumpida (cierre cortado o apertura que dejó de avanzar). */
               private static boolean interruptContext(long now) {
                   boolean closeCut = sCloseCutTs != 0 && (now - sCloseCutTs) < 400;
-                  boolean gestCut = sGestOpenTs != 0 && (now - sGestOpenTs) < 400;
                   boolean openCut = sOpenTs != 0 && sOpenFrac < 0.985f
-                          && (now - sOpenTs) < 250 && ((now - sOpenStartTs) > 150 || gestCut);
+                          && (now - sOpenTs) < 250 && (now - sOpenStartTs) > 150;
                   return closeCut || openCut;
               }
 
@@ -340,6 +340,7 @@ jobs:
 
               private static void armHandoff(int key, long now) {
                   sHoHideOld = false;
+                  sHoLogLeft = 25;
                   sHoFrom.sx = sLast.sx;
                   sHoFrom.sy = sLast.sy;
                   sHoFrom.tx = sLast.tx;
@@ -375,15 +376,7 @@ jobs:
                   }
                   if (sLast.ts == 0 || (now - sLast.ts) > 400 || !interruptContext(now)) return;
                   if (first && sLast.key != key) {
-                      if (mv == null || differs(sLast, mv[0], mv[1], mv[2], mv[3])) {
-                          boolean g = sGestOpenTs != 0 && (now - sGestOpenTs) < 400;
-                          armHandoff(-1, now);
-                          sHoHideOld = g;      // gesto sobre apertura: la capa vieja queda congelada debajo
-                          sHoHidden = false;
-                          sHoFrames = 0;
-                          if (g) XposedBridge.log("[AnimHook] traspaso inmediato (ruta de respaldo): capa nueva " + key
-                                  + " ms desde onGestureStarted=" + (now - sGestOpenTs));
-                      }
+                      if (mv == null || differs(sLast, mv[0], mv[1], mv[2], mv[3])) armHandoff(-1, now);
                   } else if (!first && sLast.key == key && mv != null && (now - sLast.ts) < 120
                           && differs(sLast, mv[0], mv[1], mv[2], mv[3])) {
                       armHandoff(key, now);
@@ -442,7 +435,14 @@ jobs:
                           if (now - sHoStart >= HANDOFF_MS) {
                               endHandoff();
                           } else {
+                              float qs = req[0], qty = req[3];
                               hoBlend(req, now);
+                              if (sHoLogLeft > 0) {
+                                  sHoLogLeft--;
+                                  XposedBridge.log("[AnimHook] DIAG traspaso capa=" + key + " w=" + hoW(now)
+                                          + " pedida esc=" + qs + " ty=" + qty
+                                          + " aplicada esc=" + req[0] + " ty=" + req[3]);
+                              }
                               float[] o = m9.clone();
                               o[Matrix.MSCALE_X] = req[0];
                               o[Matrix.MSCALE_Y] = req[1];
@@ -533,7 +533,7 @@ jobs:
                   if (qtm == null) return; // este paquete no es el launcher
 
                   sWindowRadius = systemWindowRadius();
-                  XposedBridge.log("[AnimHook] activo en " + lpp.packageName + " | build=gestfix2"
+                  XposedBridge.log("[AnimHook] activo en " + lpp.packageName + " | build=gestfix4"
                           + " | POW=" + CORNER_POW + " MULT=" + CORNER_MULT
                           + " OPEN=" + SPEED_OPEN + " CLOSE=" + SPEED_CLOSE
                           + " R=" + sWindowRadius);
@@ -545,6 +545,7 @@ jobs:
                   hookSurfaceCorners();
                   hookInterrupt(cl);
                   hookGestureDiag(cl);
+                  hookReleaseDefer();
               }
 
               /** Radio de las esquinas físicas de la pantalla (px). */
@@ -1159,6 +1160,81 @@ jobs:
               if (sHoOn && sHoHideOld && !sHoHidden && key == sHoKey && ++sHoFrames >= 3) {
                   sHoHidden = true;
                   hideOldLeash(sHoFrom.key);
+              }
+          }
+
+          // El sistema suelta (release) el SurfaceControl de la apertura al cancelarla; después ya no se le puede aplicar
+          // alpha (log: NullPointerException mNativeObject). Mientras la apertura esté a medias se aplaza ese release
+          // unos ms para poder ocultar la capa vieja cuando arranca el traspaso del gesto.
+          private static final java.util.List<Object> sDeferredRel =
+                  Collections.synchronizedList(new java.util.ArrayList<Object>());
+          private static final ThreadLocal<Boolean> IN_REL = new ThreadLocal<>();
+
+          private void hookReleaseDefer() {
+              try {
+                  Class<?> scc = XposedHelpers.findClassIfExists("android.view.SurfaceControl", null);
+                  if (scc == null) return;
+                  XposedBridge.hookAllMethods(scc, "release", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          try {
+                              if (IN_REL.get() != null || p.thisObject == null) return;
+                              long now = SystemClock.uptimeMillis();
+                              if (sOpenTs == 0 || sOpenFrac >= 0.985f || (now - sOpenTs) > 400) return;
+                              boolean tracked = false;
+                              synchronized (SURF) {
+                                  for (SurfState st : SURF.values()) {
+                                      if (st.ref != null && st.ref.get() == p.thisObject) {
+                                          tracked = true;
+                                          break;
+                                      }
+                                  }
+                              }
+                              if (!tracked) return;
+                              sDeferredRel.add(p.thisObject);
+                              p.setResult(null);
+                              XposedBridge.log("[AnimHook] release aplazado de una capa de la apertura: msDesdeFotograma="
+                                      + (now - sOpenTs) + " msDesdeGesto=" + (sGestOpenTs == 0 ? -1 : now - sGestOpenTs));
+                              scheduleDeferredRelease();
+                          } catch (Throwable t) {
+                              XposedBridge.log(t);
+                          }
+                      }
+                  });
+              } catch (Throwable t) {
+                  XposedBridge.log(t);
+              }
+          }
+
+          private static void scheduleDeferredRelease() {
+              try {
+                  new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
+                      @Override
+                      public void run() {
+                          flushDeferredRelease();
+                      }
+                  }, 700);
+              } catch (Throwable t) {
+                  flushDeferredRelease();
+              }
+          }
+
+          private static void flushDeferredRelease() {
+              Object[] arr;
+              synchronized (sDeferredRel) {
+                  arr = sDeferredRel.toArray();
+                  sDeferredRel.clear();
+              }
+              if (arr.length == 0) return;
+              IN_REL.set(Boolean.TRUE);
+              try {
+                  for (Object o : arr) {
+                      try {
+                          XposedHelpers.callMethod(o, "release");
+                      } catch (Throwable ignored) { }
+                  }
+              } finally {
+                  IN_REL.remove();
               }
           }
 
